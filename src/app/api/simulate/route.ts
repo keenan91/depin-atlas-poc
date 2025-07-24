@@ -1,46 +1,58 @@
-// src/app/api/simulate/route.ts
+import {NextRequest, NextResponse} from 'next/server'
+import {listIotRewards} from '@/lib/relay'
 
-import {NextResponse} from 'next/server'
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
+export const revalidate = 0
 
-/**
- * This is our main simulation API endpoint.
- * For the PoC, it will take a latitude and longitude and return a hardcoded
- * JSON response to prove that the frontend and backend are communicating.
- *
- * Example URL: /api/simulate?lat=40.7128&lon=-74.0060
- */
-export async function GET(request: Request) {
-  const {searchParams} = new URL(request.url)
-  const lat = searchParams.get('lat')
-  const lon = searchParams.get('lon')
+const DEFAULT_HOTSPOT = undefined
 
-  // Basic validation to ensure we received the coordinates
-  if (!lat || !lon) {
+export async function GET(req: NextRequest) {
+  const {searchParams} = new URL(req.url)
+
+  const hotspot_key = searchParams.get('hotspotKey') ?? DEFAULT_HOTSPOT
+  const from =
+    searchParams.get('from') ??
+    new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10)
+  const to = searchParams.get('to') ?? new Date().toISOString().slice(0, 10)
+
+  try {
+    const resp = await listIotRewards(
+      {hotspot_key: hotspot_key || undefined, from, to},
+      /* maxPages */ hotspot_key ? 2 : 1,
+    )
+
+    const total = resp.records.reduce((s, r) => {
+      const d = r.reward_detail || {}
+      const amount = d.amount ?? d.beacon_amount ?? d.witness_amount ?? 0
+      return s + Number(amount)
+    }, 0)
+
+    return NextResponse.json({
+      ok: true,
+      hotspot_key: hotspot_key || null,
+      from,
+      to,
+      total,
+      records: resp.records.length,
+      avg_per_record: resp.records.length ? total / resp.records.length : 0,
+      meta: resp.meta,
+      sample: resp.records.slice(0, 2),
+    })
+  } catch (e: any) {
+    console.error(
+      'Relay API error:',
+      e?.response?.status,
+      e?.response?.data || e.message,
+    )
     return NextResponse.json(
-      {error: 'Latitude and longitude are required'},
-      {status: 400},
+      {
+        ok: false,
+        error: 'Failed to fetch data from Relay API.',
+        status: e?.response?.status ?? 500,
+        details: e?.response?.data || e.message,
+      },
+      {status: e?.response?.status ?? 500},
     )
   }
-
-  // --- In the future, this is where our real logic will go ---
-  // 1. Call Hotspotty API to get hex data for the lat/lon.
-  // 2. Call Helius API to get on-chain reward data for that area.
-  // 3. Run the data through our V1 simulation model.
-  // -----------------------------------------------------------
-
-  // For now, we return a hardcoded "dummy" response for testing.
-  const dummyResponse = {
-    latitude: parseFloat(lat),
-    longitude: parseFloat(lon),
-    estimatedHNT_monthly: 15.5,
-    estimatedUSD_monthly: 75.3,
-    confidenceScore: 'High',
-    contributingFactors: {
-      nearbyHotspots: 7,
-      avgEarningsNearby_HNT: 16.2,
-      hexDensity: 'Optimal',
-    },
-  }
-
-  return NextResponse.json(dummyResponse)
 }
