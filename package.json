@@ -6,9 +6,13 @@
     "dev": "next dev --turbopack",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "ingest:iot": "tsx scripts/ingest/fetchIotRewards.ts",
+    "build:arrow": "tsx scripts/transform/rewardsToParquet.ts data/raw/iot_2025-07-01_2025-07-24.json data/features/iot_daily_sample.arrow",
+    "inspect:arrow": "tsx scripts/inspect/inspectArrow.ts"
   },
   "dependencies": {
+    "apache-arrow": "^21.0.0",
     "axios": "^1.11.0",
     "next": "15.4.3",
     "react": "19.1.0",
@@ -17,12 +21,14 @@
   "devDependencies": {
     "@eslint/eslintrc": "^3",
     "@tailwindcss/postcss": "^4",
-    "@types/node": "^20",
+    "@types/node": "^20.19.9",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
     "eslint-config-next": "15.4.3",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "ts-node": "^10.9.2",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3"
   }
 }

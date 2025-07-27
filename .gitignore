@@ -39,3 +39,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+data/raw/*
+data/features/*
+!data/features/iot_daily_sample.arrow
