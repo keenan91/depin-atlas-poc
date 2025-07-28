@@ -43,3 +43,7 @@ next-env.d.ts
 data/raw/*
 data/features/*
 !data/features/iot_daily_sample.arrow
+
+data/features/*.arrow
+data/raw/**
+data/**/*.parquet

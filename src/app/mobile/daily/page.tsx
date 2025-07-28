@@ -1,5 +1,6 @@
 'use client'
-import {useEffect, useMemo, useRef, useState} from 'react'
+
+import {useEffect, useMemo, useState} from 'react'
 import {
   LineChart,
   Line,
@@ -35,24 +36,12 @@ function movingAverage(values: number[], window = 3): (number | null)[] {
   return out
 }
 
-// helpers for default last-30-days range (UTC)
-const todayUTC = () => {
-  const d = new Date()
-  d.setUTCHours(0, 0, 0, 0)
-  return d
-}
-const toISO = (d: Date) => d.toISOString().slice(0, 10)
-
 export default function MobileDailyPage() {
-  // Default to last 30 days so the chart isn’t blank on first load
-  const defaultTo = toISO(todayUTC())
-  const dFrom = new Date(todayUTC())
-  dFrom.setUTCDate(dFrom.getUTCDate() - 29)
-  const defaultFrom = toISO(dFrom)
-
-  const [hotspot, setHotspot] = useState<string>('') // leave blank = all hotspots
-  const [from, setFrom] = useState<string>(defaultFrom)
-  const [to, setTo] = useState<string>(defaultTo)
+  const envDefault =
+    (process as any).env?.NEXT_PUBLIC_MOBILE_DEFAULT_HOTSPOT?.trim() ?? ''
+  const [hotspot, setHotspot] = useState<string>(envDefault)
+  const [from, setFrom] = useState<string>('')
+  const [to, setTo] = useState<string>('')
   const [rows, setRows] = useState<Row[]>([])
   const [loading, setLoading] = useState(false)
   const [dateError, setDateError] = useState<string | null>(null)
@@ -63,15 +52,19 @@ export default function MobileDailyPage() {
     data_ma: true,
   })
 
+  // URL -> state on first load, then auto-fetch
   useEffect(() => {
     const q = new URLSearchParams(location.search)
-    const hs = q.get('hotspot')?.trim().replace(/\s/g, '') ?? ''
-    const f = q.get('from') ?? defaultFrom
-    const t = q.get('to') ?? defaultTo
+    const hs = q.get('hotspot')?.trim().replace(/\s/g, '')
+    const f = q.get('from') ?? ''
+    const t = q.get('to') ?? ''
     if (hs) setHotspot(hs)
-    setFrom(f)
-    setTo(t)
-  }, []) // eslint-disable-line
+    if (f) setFrom(f)
+    if (t) setTo(t)
+    // kick off an initial fetch
+    setTimeout(fetchData, 0)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   useEffect(() => {
     const q = new URLSearchParams()
@@ -82,37 +75,35 @@ export default function MobileDailyPage() {
     window.history.replaceState(null, '', url)
   }, [hotspot, from, to])
 
-  async function fetchData(opts?: {
-    hotspot?: string
-    from?: string
-    to?: string
-  }) {
+  async function fetchData() {
     setLoading(true)
     setDateError(null)
     try {
       const params = new URLSearchParams()
-      const hs = (opts?.hotspot ?? hotspot).trim()
-      const f = opts?.from ?? from
-      const t = opts?.to ?? to
-      if (hs) params.set('hotspot', hs)
-      if (f) params.set('from', f)
-      if (t) params.set('to', t)
+      if (hotspot) params.set('hotspot', hotspot)
+      if (from) params.set('from', from)
+      if (to) params.set('to', to)
+
       const res = await fetch(`/api/mobile/daily?${params.toString()}`)
       if (!res.ok) throw new Error('Failed to fetch /api/mobile/daily')
       const json = await res.json()
-      setRows(json.rows ?? [])
+
+      // Fallback: if the specified hotspot yields 0 rows, refetch for "all"
+      if ((json.rows?.length ?? 0) === 0 && hotspot) {
+        const res2 = await fetch(`/api/mobile/daily`)
+        if (res2.ok) {
+          const j2 = await res2.json()
+          setRows(j2.rows ?? [])
+        } else {
+          setRows([])
+        }
+      } else {
+        setRows(json.rows ?? [])
+      }
     } finally {
       setLoading(false)
     }
   }
-
-  const didAutoFetch = useRef(false)
-  useEffect(() => {
-    if (!didAutoFetch.current) {
-      didAutoFetch.current = true
-      fetchData()
-    }
-  }, [hotspot, from, to])
 
   function onApply(e: React.FormEvent) {
     e.preventDefault()
@@ -128,7 +119,7 @@ export default function MobileDailyPage() {
       const t = from
       setFrom(f)
       setTo(t)
-      setTimeout(() => fetchData({from: f, to: t}), 0)
+      setTimeout(fetchData, 0)
       return
     }
     fetchData()
@@ -203,12 +194,34 @@ export default function MobileDailyPage() {
             loading ? 'opacity-50 cursor-not-allowed' : 'hover:bg-white/5'
           }`}
         >
-          {loading ? 'Loading…' : 'Apply'}
+          {loading ? (
+            <span className="flex items-center gap-2">
+              <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                <circle
+                  className="opacity-25"
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                />
+                <path
+                  className="opacity-75"
+                  fill="currentColor"
+                  d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                />
+              </svg>
+              Loading…
+            </span>
+          ) : (
+            'Apply'
+          )}
         </button>
 
         <button
           type="button"
           onClick={() => {
+            // CSV of current rows
             const headers = [
               'date',
               'hotspot',
@@ -337,6 +350,7 @@ export default function MobileDailyPage() {
                   name="Coverage (3‑day MA)"
                   dot={false}
                   strokeDasharray="4 4"
+                  connectNulls
                 />
               )}
               {show.data && (
@@ -357,6 +371,7 @@ export default function MobileDailyPage() {
                   name="Data (3‑day MA)"
                   dot={false}
                   strokeDasharray="4 4"
+                  connectNulls
                 />
               )}
             </LineChart>
