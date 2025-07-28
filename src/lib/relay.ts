@@ -41,11 +41,9 @@ export type IoTRewardShare = {
     beacon_amount?: number
     witness_amount?: number
     amount?: number
-    // ... add the rest as you need them
   }
 }
 
-/** Single-page fetch */
 export async function listIotRewardsOnce(params: {
   from: string
   to: string
@@ -75,6 +73,141 @@ export async function listIotRewards(
 
   while (page && page <= maxPages) {
     const resp = await listIotRewardsOnce({...params, page})
+    all.push(...resp.records)
+    lastMeta = resp.meta.pagination
+    page = resp.meta.pagination.next_page ?? 0
+  }
+
+  return {
+    records: all,
+    meta: {
+      pagination: lastMeta ?? {
+        count: all.length,
+        total_pages: 1,
+        current_page: 1,
+        next_page: null,
+        prev_page: null,
+      },
+    },
+  }
+}
+
+/* ----------------------------- MOBILE helpers ----------------------------- */
+
+export type MobileRewardShare = {
+  id: string
+  reward_type: string
+  start_period: string // "YYYY-MM-DD 00:00:00 UTC"
+  end_period: string // "YYYY-MM-DD 00:00:00 UTC"
+  reward_manifest: unknown | null
+  reward_detail: {
+    hotspot_key?: string
+    modeled_coverage_amount?: number
+    data_transfer_amount?: number
+    amount?: number
+    formatted_modeled_coverage_amount?: string
+    formatted_data_transfer_amount?: string
+    [k: string]: unknown
+  }
+}
+
+/**
+ * Single-page fetch (MOBILE).
+ * Tries a few likely paths and returns the first one that responds.
+ */
+export async function listMobileRewardsOnce(params: {
+  from: string
+  to: string
+  hotspot_key?: string
+  reward_type?: string
+  page?: number
+}) {
+  const candidatePaths = [
+    '/helium/l2/mobile-reward-shares',
+    '/helium/l2/rewards/mobile',
+    '/helium/l2/mobile/rewards',
+  ]
+
+  let lastErr: unknown = null
+
+  for (const p of candidatePaths) {
+    try {
+      const {data} = await relay.get<ListResponse<MobileRewardShare>>(p, {
+        params,
+      })
+      if (data && Array.isArray((data as any).records)) {
+        return data
+      }
+
+      const rows = (data as any)?.rows
+      if (Array.isArray(rows)) {
+        return {
+          records: rows as MobileRewardShare[],
+          meta: {
+            pagination: {
+              count: rows.length,
+              total_pages: 1,
+              current_page: params.page ?? 1,
+              next_page: null,
+              prev_page: null,
+            },
+          },
+        }
+      }
+      if (Array.isArray(data)) {
+        return {
+          records: data as MobileRewardShare[],
+          meta: {
+            pagination: {
+              count: (data as any[]).length,
+              total_pages: 1,
+              current_page: params.page ?? 1,
+              next_page: null,
+              prev_page: null,
+            },
+          },
+        }
+      }
+
+      return {
+        records: [],
+        meta: {
+          pagination: {
+            count: 0,
+            total_pages: 1,
+            current_page: params.page ?? 1,
+            next_page: null,
+            prev_page: null,
+          },
+        },
+      }
+    } catch (err: any) {
+      if (err?.response?.status === 404) {
+        lastErr = err
+        continue
+      }
+      throw err
+    }
+  }
+
+  throw lastErr ?? new Error('No MOBILE rewards endpoint matched')
+}
+
+export async function listMobileRewards(
+  params: {
+    from: string
+    to: string
+    hotspot_key?: string
+    reward_type?: string
+  },
+  maxPages = 5,
+): Promise<ListResponse<MobileRewardShare>> {
+  let page = 1
+  const all: MobileRewardShare[] = []
+  let lastMeta: Pagination | null = null
+
+  while (page && page <= maxPages) {
+    const resp = await listMobileRewardsOnce({...params, page})
     all.push(...resp.records)
     lastMeta = resp.meta.pagination
     page = resp.meta.pagination.next_page ?? 0
