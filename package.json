@@ -9,7 +9,8 @@
     "lint": "next lint",
     "ingest:iot": "tsx scripts/ingest/fetchIotRewards.ts",
     "build:arrow": "tsx scripts/transform/rewardsToParquet.ts data/raw/iot_2025-07-01_2025-07-24.json data/features/iot_daily_sample.arrow",
-    "inspect:arrow": "tsx scripts/inspect/inspectArrow.ts"
+    "inspect:arrow": "tsx scripts/inspect/inspectArrow.ts",
+    "features:refresh": "tsx scripts/features/refresh.ts"
   },
   "dependencies": {
     "apache-arrow": "^21.0.0",

@@ -7,7 +7,7 @@ export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 const DEFAULT_ARROW_PATH =
-  process.env.IOT_ARROW_PATH ?? 'data/features/iot_daily_sample.arrow'
+  process.env.IOT_ARROW_FILE ?? 'data/features/iot/latest.arrow'
 
 type Row = {
   date?: string
@@ -121,7 +121,6 @@ export async function GET(req: NextRequest) {
         const de = asString(
           idx.date_end >= 0 ? get(i, idx.date_end) : undefined,
         )
-        // Keep if the row interval intersects query interval
         const qFrom = from ?? '0000-00-00'
         const qTo = to ?? '9999-12-31'
         const rowFrom = ds ?? de ?? '0000-00-00'

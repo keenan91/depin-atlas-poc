@@ -20,6 +20,8 @@ type Row = {
   speedtest: number
   total_bones: number
   reward_type: string
+  lat?: number
+  lon?: number
 }
 
 const fmt = new Intl.NumberFormat('en-US')
@@ -37,13 +39,15 @@ function movingAverage(values: number[], window = 3): (number | null)[] {
 }
 
 export default function MobileDailyPage() {
-  const envDefault =
-    (process as any).env?.NEXT_PUBLIC_MOBILE_DEFAULT_HOTSPOT?.trim() ?? ''
-  const [hotspot, setHotspot] = useState<string>(envDefault)
+  const [hotspot, setHotspot] = useState<string>(
+    '1trSusf4AydmebT8DXYGRQ6CFRrfRnMZbWai9tBcCAHzbJysMe46vjtKbZcNShdGP2nJzDhztzjKpiqpQwBACoq6deKZgdHMyqnQwSkLF1vkaaEcQ5d91NHy6UzL3mQ4NHsWDgXuoQsH5ihKryiCm8cJSaoqxWy8WNCMGiBaVzFsHqVAx5K9Mmav1Sx1dq5S6TzamNXuxdJBYyWs3GQXiFVpecWKVnbS5MWd7EX2ytJrcsShRxBaWbQWuq64zW55UuywHPVQyXzCx5WrHAwRhGnNXYcssfhmjdCqiWtNaXyWTeCg1DbvjTB8RWyXnhBgr5F675Z3ysdavqyMQadMTAEZHJrWqVB7NiyTU822o1j4Rt'
+      .trim()
+      .replace(/\s/g, ''),
+  )
   const [from, setFrom] = useState<string>('')
   const [to, setTo] = useState<string>('')
   const [rows, setRows] = useState<Row[]>([])
-  const [loading, setLoading] = useState(false)
+  const [loading, setLoading] = useState<boolean>(false)
   const [dateError, setDateError] = useState<string | null>(null)
   const [show, setShow] = useState({
     coverage: true,
@@ -52,7 +56,6 @@ export default function MobileDailyPage() {
     data_ma: true,
   })
 
-  // URL -> state on first load, then auto-fetch
   useEffect(() => {
     const q = new URLSearchParams(location.search)
     const hs = q.get('hotspot')?.trim().replace(/\s/g, '')
@@ -61,9 +64,6 @@ export default function MobileDailyPage() {
     if (hs) setHotspot(hs)
     if (f) setFrom(f)
     if (t) setTo(t)
-    // kick off an initial fetch
-    setTimeout(fetchData, 0)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   useEffect(() => {
@@ -83,23 +83,10 @@ export default function MobileDailyPage() {
       if (hotspot) params.set('hotspot', hotspot)
       if (from) params.set('from', from)
       if (to) params.set('to', to)
-
       const res = await fetch(`/api/mobile/daily?${params.toString()}`)
       if (!res.ok) throw new Error('Failed to fetch /api/mobile/daily')
       const json = await res.json()
-
-      // Fallback: if the specified hotspot yields 0 rows, refetch for "all"
-      if ((json.rows?.length ?? 0) === 0 && hotspot) {
-        const res2 = await fetch(`/api/mobile/daily`)
-        if (res2.ok) {
-          const j2 = await res2.json()
-          setRows(j2.rows ?? [])
-        } else {
-          setRows([])
-        }
-      } else {
-        setRows(json.rows ?? [])
-      }
+      setRows(json.rows ?? [])
     } finally {
       setLoading(false)
     }
@@ -115,6 +102,7 @@ export default function MobileDailyPage() {
       return
     }
     if (from && to && from > to) {
+      // swap
       const f = to
       const t = from
       setFrom(f)
@@ -124,6 +112,11 @@ export default function MobileDailyPage() {
     }
     fetchData()
   }
+
+  useEffect(() => {
+    fetchData()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const chartData = useMemo(() => {
     const cov = rows.map((r) => r.coverage || 0)
@@ -163,7 +156,7 @@ export default function MobileDailyPage() {
             onChange={(e) =>
               setHotspot(e.target.value.trim().replace(/\s/g, ''))
             }
-            placeholder="ECC key (leave blank for all)"
+            placeholder="ECC key"
           />
         </div>
         <div className="flex flex-col">
@@ -222,7 +215,7 @@ export default function MobileDailyPage() {
           type="button"
           onClick={() => {
             // CSV of current rows
-            const headers = [
+            const headers: (keyof Row)[] = [
               'date',
               'hotspot',
               'coverage',
