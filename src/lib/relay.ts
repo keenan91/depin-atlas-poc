@@ -1,22 +1,5 @@
 import axios from 'axios'
 
-const BASE_URL =
-  process.env.RELAY_BASE_URL ?? 'https://api.relaywireless.com/v1'
-const API_KEY = process.env.RELAY_API_KEY
-
-if (!API_KEY) {
-  throw new Error('RELAY_API_KEY is not set')
-}
-
-export const relay = axios.create({
-  baseURL: BASE_URL,
-  timeout: 15_000,
-  headers: {
-    Authorization: `Bearer ${API_KEY}`,
-    Accept: 'application/json',
-  },
-})
-
 export type Pagination = {
   count: number
   total_pages: number
@@ -44,14 +27,52 @@ export type IoTRewardShare = {
   }
 }
 
-export async function listIotRewardsOnce(params: {
-  from: string
-  to: string
-  hotspot_key?: string
-  reward_type?: string
-  page?: number
-}) {
-  const {data} = await relay.get<ListResponse<IoTRewardShare>>(
+export type MobileRewardShare = {
+  id: string
+  reward_type: string
+  start_period: string // "YYYY-MM-DD 00:00:00 UTC"
+  end_period: string // "YYYY-MM-DD 00:00:00 UTC"
+  reward_manifest: unknown | null
+  reward_detail: {
+    hotspot_key?: string
+    modeled_coverage_amount?: number
+    data_transfer_amount?: number
+    amount?: number
+    formatted_modeled_coverage_amount?: string
+    formatted_data_transfer_amount?: string
+    [k: string]: unknown
+  }
+}
+
+export function createRelay(apiKey: string) {
+  const BASE_URL =
+    process.env.RELAY_BASE_URL ?? 'https://api.relaywireless.com/v1'
+
+  if (!apiKey) {
+    throw new Error('RELAY_API_KEY is required')
+  }
+
+  return axios.create({
+    baseURL: BASE_URL,
+    timeout: 15_000,
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: 'application/json',
+    },
+  })
+}
+
+export async function listIotRewardsOnce(
+  params: {
+    from: string
+    to: string
+    hotspot_key?: string
+    reward_type?: string
+    page?: number
+  },
+  relayInstance: ReturnType<typeof createRelay>,
+) {
+  const {data} = await relayInstance.get<ListResponse<IoTRewardShare>>(
     '/helium/l2/iot-reward-shares',
     {params},
   )
@@ -65,14 +86,15 @@ export async function listIotRewards(
     hotspot_key?: string
     reward_type?: string
   },
-  maxPages = 5, // <- bump later
+  maxPages = 5,
+  relayInstance: ReturnType<typeof createRelay>,
 ): Promise<ListResponse<IoTRewardShare>> {
   let page = 1
   const all: IoTRewardShare[] = []
   let lastMeta: Pagination | null = null
 
   while (page && page <= maxPages) {
-    const resp = await listIotRewardsOnce({...params, page})
+    const resp = await listIotRewardsOnce({...params, page}, relayInstance)
     all.push(...resp.records)
     lastMeta = resp.meta.pagination
     page = resp.meta.pagination.next_page ?? 0
@@ -94,34 +116,20 @@ export async function listIotRewards(
 
 /* ----------------------------- MOBILE helpers ----------------------------- */
 
-export type MobileRewardShare = {
-  id: string
-  reward_type: string
-  start_period: string // "YYYY-MM-DD 00:00:00 UTC"
-  end_period: string // "YYYY-MM-DD 00:00:00 UTC"
-  reward_manifest: unknown | null
-  reward_detail: {
-    hotspot_key?: string
-    modeled_coverage_amount?: number
-    data_transfer_amount?: number
-    amount?: number
-    formatted_modeled_coverage_amount?: string
-    formatted_data_transfer_amount?: string
-    [k: string]: unknown
-  }
-}
-
 /**
  * Single-page fetch (MOBILE).
  * Tries a few likely paths and returns the first one that responds.
  */
-export async function listMobileRewardsOnce(params: {
-  from: string
-  to: string
-  hotspot_key?: string
-  reward_type?: string
-  page?: number
-}) {
+export async function listMobileRewardsOnce(
+  params: {
+    from: string
+    to: string
+    hotspot_key?: string
+    reward_type?: string
+    page?: number
+  },
+  relayInstance: ReturnType<typeof createRelay>,
+) {
   const candidatePaths = [
     '/helium/l2/mobile-reward-shares',
     '/helium/l2/rewards/mobile',
@@ -132,9 +140,12 @@ export async function listMobileRewardsOnce(params: {
 
   for (const p of candidatePaths) {
     try {
-      const {data} = await relay.get<ListResponse<MobileRewardShare>>(p, {
-        params,
-      })
+      const {data} = await relayInstance.get<ListResponse<MobileRewardShare>>(
+        p,
+        {
+          params,
+        },
+      )
       if (data && Array.isArray((data as any).records)) {
         return data
       }
@@ -201,13 +212,14 @@ export async function listMobileRewards(
     reward_type?: string
   },
   maxPages = 5,
+  relayInstance: ReturnType<typeof createRelay>,
 ): Promise<ListResponse<MobileRewardShare>> {
   let page = 1
   const all: MobileRewardShare[] = []
   let lastMeta: Pagination | null = null
 
   while (page && page <= maxPages) {
-    const resp = await listMobileRewardsOnce({...params, page})
+    const resp = await listMobileRewardsOnce({...params, page}, relayInstance)
     all.push(...resp.records)
     lastMeta = resp.meta.pagination
     page = resp.meta.pagination.next_page ?? 0
