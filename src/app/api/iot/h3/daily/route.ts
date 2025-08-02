@@ -1,166 +1,153 @@
 import {NextRequest, NextResponse} from 'next/server'
-import path from 'node:path'
-import fs from 'node:fs'
 import {tableFromIPC} from 'apache-arrow'
-import {cellToLatLng as h3ToLatLng} from 'h3-js'
+import fs from 'node:fs'
+import path from 'node:path'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-// Base directory containing r{RES}/latest.arrow
-const BASE_DIR =
-  process.env.IOT_H3_DIR ?? path.resolve('data', 'features', 'iot', 'h3')
+const DEFAULT_ARROW_PATH =
+  process.env.IOT_ARROW_FILE ?? 'data/features/iot/ca_iot_daily.arrow'
 
-type H3Row = {
-  date?: string
+type Row = {
   hex?: string
-  res?: number
+  date?: string
   beacon?: number
   witness?: number
-  coverage?: number
-  data?: number
-  total_bones?: number
+  dc_transfer?: number
+  total_rewards?: number
+  poc_rewards?: number
   hotspot_count?: number
+  density_k1?: number
+  ma_3d_total?: number
+  ma_3d_poc?: number
+  transmit_scale_approx?: number
 }
 
-function asNum(v: unknown): number | undefined {
-  if (v == null) return undefined
-  const n = Number(v)
-  return Number.isFinite(n) ? n : undefined
-}
-function asStr(v: unknown): string | undefined {
+function asString(v: unknown): string | undefined {
   return v == null ? undefined : String(v)
 }
 
-function parseBBox(s?: string) {
-  if (!s) return null
-  const parts = s.split(',').map((x) => Number(x.trim()))
-  if (parts.length !== 4 || parts.some((x) => !Number.isFinite(x))) return null
-  const [minLon, minLat, maxLon, maxLat] = parts
-  return {minLon, minLat, maxLon, maxLat}
-}
-function inBBox(lon: number, lat: number, bbox: ReturnType<typeof parseBBox>) {
-  if (!bbox) return true
-  return (
-    lon >= bbox.minLon &&
-    lon <= bbox.maxLon &&
-    lat >= bbox.minLat &&
-    lat <= bbox.maxLat
-  )
+function asNumber(v: unknown): number | undefined {
+  if (v == null) return undefined
+  const n = Number(v)
+  return Number.isFinite(n) ? n : undefined
 }
 
 export async function GET(req: NextRequest) {
   try {
     const url = new URL(req.url)
-
-    const res = Number(url.searchParams.get('res') ?? 9)
-    const from = url.searchParams.get('from') ?? undefined
-    const to = url.searchParams.get('to') ?? undefined
-    const hexFilter = url.searchParams.get('hex') // comma separated list
-    const bbox = parseBBox(url.searchParams.get('bbox') ?? undefined)
-    const field = (url.searchParams.get('field') ?? 'witness') as
-      | 'beacon'
-      | 'witness'
-      | 'data'
-      | 'coverage'
-      | 'total_bones'
-    const limit = Number(url.searchParams.get('limit') ?? 5000)
-
-    const file = path.resolve(BASE_DIR, `r${res}`, 'latest.arrow')
-    if (!fs.existsSync(file)) {
+    const hex = url.searchParams.get('hex') ?? undefined
+    const from = url.searchParams.get('from') ?? undefined // YYYY-MM-DD
+    const to = url.searchParams.get('to') ?? undefined // YYYY-MM-DD
+    const limit = Number(url.searchParams.get('limit') ?? '5000')
+    const file = url.searchParams.get('file') ?? DEFAULT_ARROW_PATH
+    const absolute = path.resolve(file)
+    if (!fs.existsSync(absolute)) {
       return NextResponse.json(
-        {
-          ok: true,
-          file,
-          status: {lastUpdated: null, range: null},
-          rows: [],
-          totals: {},
-          res,
-        },
-        {status: 200},
+        {ok: false, error: `Arrow file not found: ${absolute}`},
+        {status: 404},
       )
     }
 
-    const stat = fs.statSync(file)
-    const buf = fs.readFileSync(file)
+    const buf = fs.readFileSync(absolute)
     const table = tableFromIPC(buf)
 
-    const fields = table.schema.fields.map((f) => f.name)
-    const idx = (n: string) => fields.indexOf(n)
-    const ix = {
-      date: idx('date'),
-      hex: idx('hex'),
-      res: idx('res'),
-      beacon: idx('beacon'),
-      witness: idx('witness'),
-      coverage: idx('coverage'),
-      data: idx('data'),
-      total_bones: idx('total_bones'),
-      hotspot_count: idx('hotspot_count'),
+    const fields = table.schema.fields
+    const colIndex = (n: string) => fields.findIndex((f) => f.name === n)
+    const idx = {
+      hex: colIndex('hex'),
+      date: colIndex('date'),
+      beacon: colIndex('beacon'),
+      witness: colIndex('witness'),
+      dc_transfer: colIndex('dc_transfer'),
+      total_rewards: colIndex('total_rewards'),
+      poc_rewards: colIndex('poc_rewards'),
+      hotspot_count: colIndex('hotspot_count'),
+      density_k1: colIndex('density_k1'),
+      ma_3d_total: colIndex('ma_3d_total'),
+      ma_3d_poc: colIndex('ma_3d_poc'),
+      transmit_scale_approx: colIndex('transmit_scale_approx'),
     }
-    const get = (r: number, c: number) =>
-      c >= 0 ? (table.getChildAt(c)?.get(r) as any) : undefined
 
-    const hexSet = new Set<string>()
-    if (hexFilter) {
-      for (const h of hexFilter.split(',').map((s) => s.trim())) {
-        if (h) hexSet.add(h)
+    const get = (i: number, c: number) => table.getChildAt(c)?.get(i)
+
+    const rows: Row[] = []
+    const pushRow = (i: number) => {
+      const r: Row = {
+        hex: asString(idx.hex >= 0 ? get(i, idx.hex) : undefined),
+        date: asString(idx.date >= 0 ? get(i, idx.date) : undefined),
+        beacon: asNumber(idx.beacon >= 0 ? get(i, idx.beacon) : undefined),
+        witness: asNumber(idx.witness >= 0 ? get(i, idx.witness) : undefined),
+        dc_transfer: asNumber(
+          idx.dc_transfer >= 0 ? get(i, idx.dc_transfer) : undefined,
+        ),
+        total_rewards: asNumber(
+          idx.total_rewards >= 0 ? get(i, idx.total_rewards) : undefined,
+        ),
+        poc_rewards: asNumber(
+          idx.poc_rewards >= 0 ? get(i, idx.poc_rewards) : undefined,
+        ),
+        hotspot_count: asNumber(
+          idx.hotspot_count >= 0 ? get(i, idx.hotspot_count) : undefined,
+        ),
+        density_k1: asNumber(
+          idx.density_k1 >= 0 ? get(i, idx.density_k1) : undefined,
+        ),
+        ma_3d_total: asNumber(
+          idx.ma_3d_total >= 0 ? get(i, idx.ma_3d_total) : undefined,
+        ),
+        ma_3d_poc: asNumber(
+          idx.ma_3d_poc >= 0 ? get(i, idx.ma_3d_poc) : undefined,
+        ),
+        transmit_scale_approx: asNumber(
+          idx.transmit_scale_approx >= 0
+            ? get(i, idx.transmit_scale_approx)
+            : undefined,
+        ),
       }
+      rows.push(r)
     }
 
-    const rows: H3Row[] = []
+    const inRange = (d?: string) => {
+      if (!d) return true
+      if (from && d < from) return false
+      if (to && d > to) return false
+      return true
+    }
+
     for (let i = 0; i < table.numRows && rows.length < limit; i++) {
-      const d = asStr(get(i, ix.date))
-      if (from && d && d < from) continue
-      if (to && d && d > to) continue
+      const currentHex = asString(idx.hex >= 0 ? get(i, idx.hex) : undefined)
+      if (hex && currentHex !== hex) continue
 
-      const hex = asStr(get(i, ix.hex))
-      if (!hex) continue
-      if (hexSet.size > 0 && !hexSet.has(hex)) continue
+      const d = asString(idx.date >= 0 ? get(i, idx.date) : undefined)
+      if (d && !inRange(d)) continue
 
-      if (bbox) {
-        const [lat, lon] = h3ToLatLng(hex)
-        if (!inBBox(lon, lat, bbox)) continue
-      }
-
-      rows.push({
-        date: d,
-        hex,
-        res: asNum(get(i, ix.res)),
-        beacon: asNum(get(i, ix.beacon)) ?? 0,
-        witness: asNum(get(i, ix.witness)) ?? 0,
-        coverage: asNum(get(i, ix.coverage)) ?? 0,
-        data: asNum(get(i, ix.data)) ?? 0,
-        total_bones: asNum(get(i, ix.total_bones)) ?? 0,
-        hotspot_count: asNum(get(i, ix.hotspot_count)) ?? 0,
-      })
+      pushRow(i)
     }
 
-    const sum = (k: keyof H3Row) =>
-      rows.reduce((s, r) => s + (Number(r[k] ?? 0) || 0), 0)
-
-    const range =
-      rows.length > 0
-        ? {from: rows[0].date, to: rows[rows.length - 1].date}
-        : null
-
-    const totals: Record<string, number> = {
-      rows: rows.length,
+    const sum = (key: keyof Row) =>
+      rows.reduce(
+        (s, r) => s + (typeof r[key] === 'number' ? (r[key] as number) : 0),
+        0,
+      )
+    const totals = {
       beacon: sum('beacon'),
       witness: sum('witness'),
-      coverage: sum('coverage'),
-      data: sum('data'),
-      total_bones: sum('total_bones'),
+      dc_transfer: sum('dc_transfer'),
+      total_rewards: sum('total_rewards'),
+      poc_rewards: sum('poc_rewards'),
       hotspot_count: sum('hotspot_count'),
-      selected: sum(field), // convenience
+      density_k1: sum('density_k1'),
+      ma_3d_total: sum('ma_3d_total'),
+      ma_3d_poc: sum('ma_3d_poc'),
+      rows: rows.length,
     }
 
     return NextResponse.json({
       ok: true,
-      file,
-      res,
-      filters: {from, to, hex: hexFilter, bbox, field, limit},
-      status: {lastUpdated: stat.mtime.toISOString(), range},
+      file: absolute,
+      filters: {hex, from, to, limit},
       totals,
       rows,
     })
