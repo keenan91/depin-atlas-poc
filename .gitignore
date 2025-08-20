@@ -47,3 +47,5 @@ data/features/*
 data/features/*.arrow
 data/raw/**
 data/**/*.parquet
+data/ca_iot_daily.json
+data/lookup/
