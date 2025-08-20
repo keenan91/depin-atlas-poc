@@ -10,9 +10,14 @@
     "ingest:iot": "tsx scripts/ingest/fetchIotRewards.ts",
     "build:arrow": "tsx scripts/transform/rewardsToParquet.ts data/raw/iot_2025-07-01_2025-07-24.json data/features/iot_daily_sample.arrow",
     "inspect:arrow": "tsx scripts/inspect/inspectArrow.ts",
-    "features:refresh": "tsx scripts/features/refresh.ts"
+    "features:refresh": "tsx scripts/features/refresh.ts",
+    "postinstall": "cp -r node_modules/onnxruntime-web/dist/*.wasm public/"
   },
   "dependencies": {
+    "@react-spring/web": "^10.0.1",
+    "@react-three/drei": "^10.6.1",
+    "@react-three/fiber": "^9.3.0",
+    "@react-three/postprocessing": "^3.0.4",
     "@types/lodash": "^4.17.20",
     "apache-arrow": "^21.0.0",
     "axios": "^1.11.0",
@@ -23,12 +28,14 @@
     "leaflet": "^1.9.4",
     "lodash": "^4.17.21",
     "next": "15.4.3",
+    "onnxruntime-node": "^1.14.0",
     "parquetjs": "^0.11.2",
     "protobufjs": "^7.5.3",
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "react-leaflet": "^5.0.0",
-    "recharts": "^3.1.0"
+    "recharts": "^3.1.0",
+    "three": "^0.179.1"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3",

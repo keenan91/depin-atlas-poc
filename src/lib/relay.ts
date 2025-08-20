@@ -54,7 +54,7 @@ export function createRelay(apiKey: string) {
 
   return axios.create({
     baseURL: BASE_URL,
-    timeout: 15_000,
+    timeout: 60_000,
     headers: {
       Authorization: `Bearer ${apiKey}`,
       Accept: 'application/json',

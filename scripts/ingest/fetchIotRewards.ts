@@ -1,151 +1,239 @@
-import fs from 'fs/promises'
-import {existsSync, createReadStream, appendFileSync} from 'fs'
+// scripts/ingest/fetchIotRewardsByHotspot.ts
+import fs from 'fs'
+import fsp from 'fs/promises'
 import path from 'path'
 import readline from 'readline'
-import {listIotRewards, createRelay, IoTRewardShare} from '@/lib/relay'
+import {listIotRewards, createRelay} from '@/lib/relay'
 
 import * as dotenv from 'dotenv'
 dotenv.config({path: path.resolve(__dirname, '../../.env.local')})
 
-async function delay(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+type LookupRec = {lat: number; lon: number}
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms))
 }
 
-async function fetchHotspotRewards(
-  key: string,
-  start: string,
-  end: string,
-  relayInstance: ReturnType<typeof createRelay>,
-) {
-  try {
-    const res = await listIotRewards(
-      {hotspot_key: key, from: start, to: end},
-      20,
-      relayInstance,
-    )
-    return res.records.map((r) => ({...r, hotspot_key: key}))
-  } catch (e: unknown) {
-    console.warn(`Failed to fetch rewards for ${key}: ${(e as Error).message}`)
-    return []
-  }
+function parseKeys(argKeys?: string): string[] {
+  const envKeys = process.env.RELAY_API_KEYS || process.env.RELAY_API_KEY || ''
+  const raw = (argKeys || envKeys || '')
+    .split(/[, \n\t]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+  const uniq = Array.from(new Set(raw))
+  if (uniq.length === 0)
+    throw new Error('No API keys provided (RELAY_API_KEYS or --apiKeys).')
+  return uniq
 }
 
-async function getCompletedKeys(filePath: string): Promise<Set<string>> {
-  const completedKeys = new Set<string>()
-  if (!existsSync(filePath)) {
-    return completedKeys
-  }
-  const fileStream = createReadStream(filePath)
+async function readCompletedList(p: string): Promise<Set<string>> {
+  const done = new Set<string>()
+  if (!fs.existsSync(p)) return done
   const rl = readline.createInterface({
-    input: fileStream,
+    input: fs.createReadStream(p),
     crlfDelay: Infinity,
   })
   for await (const line of rl) {
-    try {
-      const record = JSON.parse(line)
-      if (record.hotspot_key) {
-        completedKeys.add(record.hotspot_key)
-      }
-    } catch (e) {
-      console.warn('Skipping corrupt line in output file:', line)
-    }
+    const k = line.trim()
+    if (k) done.add(k)
   }
-  return completedKeys
+  return done
 }
 
-async function fetchIotRewards(
-  start: string,
-  end: string,
+async function appendCompleted(p: string, key: string) {
+  await fsp.mkdir(path.dirname(p), {recursive: true})
+  await fsp.appendFile(p, key + '\n', 'utf8')
+}
+
+async function loadLookup(
   lookupFile: string,
-  limit: number,
-  chunkSize: number,
-  apiKey: string,
-  outputFilename: string,
-) {
-  if (!apiKey) {
-    throw new Error('API key is required')
+): Promise<Record<string, LookupRec>> {
+  const abs = path.resolve(lookupFile)
+  const json = await fsp.readFile(abs, 'utf-8')
+  return JSON.parse(json) as Record<string, LookupRec>
+}
+
+async function withRetries<T>(
+  fn: () => Promise<T>,
+  opts: {retries: number; backoffMs: number; label: string},
+): Promise<T> {
+  const {retries, backoffMs, label} = opts
+  let attempt = 0
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    try {
+      return await fn()
+    } catch (e: any) {
+      attempt++
+      const msg = e?.message || String(e)
+      if (attempt > retries) {
+        console.warn(`[fail] ${label}: ${msg}`)
+        throw e
+      }
+      const wait = backoffMs * Math.max(1, attempt)
+      console.warn(
+        `[retry ${attempt}/${retries}] ${label}: ${msg} — waiting ${wait}ms`,
+      )
+      await sleep(wait)
+    }
   }
-  console.log('API Key loaded:', apiKey.substring(0, 8) + '...')
+}
 
-  const relayInstance = createRelay(apiKey)
-  const lookup = JSON.parse(
-    await fs.readFile(path.resolve(lookupFile), 'utf-8'),
-  ) as Record<string, {lat: number; lon: number}>
-  const allKeys = Object.keys(lookup).slice(
-    0,
-    limit || Object.keys(lookup).length,
-  )
+async function main() {
+  // ---------------- CLI args ----------------
+  const args = process.argv.slice(2).reduce((acc, arg) => {
+    const [k, v] = arg.split('=')
+    if (k && v) acc[k.replace(/^--/, '')] = v
+    return acc
+  }, {} as Record<string, string>)
 
-  const filePath = path.join(__dirname, '../../data/raw/iot', outputFilename)
-  console.log(`Writing output to: ${filePath}`)
+  const start = args.start || '2025-07-01'
+  const end = args.end || '2025-08-12'
+  const lookupPath = args.lookup || 'data/lookup/ca_iot_hotspots.json' // California set
+  const limit = Number(args.limit || '0') // 0 = all
+  const chunkSize = Number(args.chunkSize || '5')
+  const chunkDelay = Number(args.chunkDelay || '1200') // ms between chunks
+  const retries = Number(args.retries || '3')
+  const relayPageLimit = Number(args.relayPageLimit || '20') // passed to listIotRewards (keep your working value)
+  const apiKeys = parseKeys(args.apiKeys)
 
-  const completedKeys = await getCompletedKeys(filePath)
+  const outName = args.output || `iot_hotspots_${start}_${end}.jsonl`
+  const outPath = path.resolve(__dirname, '../../data/raw/iot', outName)
+  const donePath = outPath.replace(/\.jsonl$/i, '.completed.txt')
+
+  await fsp.mkdir(path.dirname(outPath), {recursive: true})
+
+  console.log('[cfg]', {
+    start,
+    end,
+    chunkSize,
+    chunkDelay,
+    retries,
+    relayPageLimit,
+  })
+  console.log(`[cfg] output: ${outPath}`)
+  console.log(`[cfg] keys: ${apiKeys.length}`)
+  console.log(`[cfg] lookup: ${lookupPath}`)
+
+  // ---------------- Load hotspot set (California) ----------------
+  const lookup = await loadLookup(lookupPath)
+  const allKeys = Object.keys(lookup)
+  const keysSlice = limit > 0 ? allKeys.slice(0, limit) : allKeys
+
+  // ---------------- Resume: read completed.txt ----------------
+  const completed = await readCompletedList(donePath)
+  const remaining = keysSlice.filter((k) => !completed.has(k))
+
   console.log(
-    `Found ${completedKeys.size} hotspots already completed in output file.`,
+    `[resume] completed: ${completed.size} • remaining: ${remaining.length} / ${keysSlice.length}`,
   )
-
-  const keysToFetch = allKeys.filter((key) => !completedKeys.has(key))
-  console.log(
-    `Fetching rewards for ${keysToFetch.length} remaining hotspots from ${start} to ${end}`,
-  )
-
-  if (keysToFetch.length === 0) {
-    console.log('All hotspots have been processed. Exiting.')
+  if (remaining.length === 0) {
+    console.log('Nothing to do. Exiting.')
     return
   }
 
-  let totalNewRewards = 0
-  for (let i = 0; i < keysToFetch.length; i += chunkSize) {
-    const chunk = keysToFetch.slice(i, i + chunkSize)
-    console.log(`\nProcessing chunk starting with: ${chunk[0]}`)
-
-    const chunkRewards = await Promise.allSettled(
-      chunk.map((key) => fetchHotspotRewards(key, start, end, relayInstance)),
-    )
-
-    let newRewardsInChunk = 0
-    chunkRewards.forEach((result) => {
-      if (result.status === 'fulfilled' && result.value.length > 0) {
-        result.value.forEach((reward) => {
-          appendFileSync(filePath, JSON.stringify(reward) + '\n')
-          newRewardsInChunk++
-        })
-      }
-    })
-
-    totalNewRewards += newRewardsInChunk
-    console.log(
-      `Processed chunk ${i / chunkSize + 1} of ${Math.ceil(
-        keysToFetch.length / chunkSize,
-      )}. Added ${newRewardsInChunk} new reward entries. Total new: ${totalNewRewards}`,
-    )
-
-    await delay(5000)
+  // ---------------- Writer (append as we go; safe on interrupt) ----------------
+  const outFd = fs.openSync(outPath, 'a') // append mode; sync writes
+  const writeRows = (rows: any[]) => {
+    if (!rows || rows.length === 0) return 0
+    const lines = rows.map((r) => JSON.stringify(r)).join('\n') + '\n'
+    fs.writeSync(outFd, lines, null, 'utf8')
+    return rows.length
   }
 
-  console.log(
-    `\n✅ Done. Added a total of ${totalNewRewards} new reward entries to ${filePath}`,
-  )
+  // Graceful shutdown summary
+  let totalWritten = 0
+  let chunksDone = 0
+  const startedAt = Date.now()
+  const onExit = () => {
+    try {
+      fs.closeSync(outFd)
+    } catch {}
+    const mins = ((Date.now() - startedAt) / 60000).toFixed(1)
+    console.log(
+      `\n[summary] chunks=${chunksDone} • rows=${totalWritten} • minutes=${mins}`,
+    )
+  }
+  process.on('SIGINT', () => {
+    console.log('\n[signal] SIGINT')
+    onExit()
+    process.exit(0)
+  })
+  process.on('SIGTERM', () => {
+    console.log('\n[signal] SIGTERM')
+    onExit()
+    process.exit(0)
+  })
+  process.on('exit', onExit)
+
+  // ---------------- Chunked fetch with key rotation ----------------
+  for (let i = 0; i < remaining.length; i += chunkSize) {
+    const chunk = remaining.slice(i, i + chunkSize)
+    const prettyIdx = Math.floor(i / chunkSize) + 1
+    console.log(
+      `\n[chunk ${prettyIdx}/${Math.ceil(
+        remaining.length / chunkSize,
+      )}] starting with: ${chunk[0]}`,
+    )
+
+    const results = await Promise.allSettled(
+      chunk.map(async (hotspotKey, j) => {
+        // Rotate key per item in chunk
+        const keyIdx = (i + j) % apiKeys.length
+        const apiKey = apiKeys[keyIdx]
+        const relay = createRelay(apiKey)
+
+        const label = `hotspot ${hotspotKey.slice(
+          0,
+          6,
+        )}… (${start}→${end}) [key#${keyIdx + 1}]`
+        const recs = await withRetries(
+          async () => {
+            const res = await listIotRewards(
+              {hotspot_key: hotspotKey, from: start, to: end},
+              relayPageLimit,
+              relay,
+            )
+            return res.records || []
+          },
+          {retries, backoffMs: 1200, label},
+        )
+
+        const wrote = writeRows(recs)
+        totalWritten += wrote
+
+        // Mark hotspot COMPLETE only after successful fetch finished
+        await appendCompleted(donePath, hotspotKey)
+
+        return {hotspotKey, wrote}
+      }),
+    )
+
+    // Per-chunk reporting
+    let chunkRows = 0,
+      ok = 0,
+      fail = 0
+    for (const r of results) {
+      if (r.status === 'fulfilled') {
+        ok++
+        chunkRows += r.value.wrote
+      } else {
+        fail++
+        // Do NOT mark completed on failure; will retry on next run
+      }
+    }
+    chunksDone++
+    console.log(
+      `[chunk ${prettyIdx}] ok=${ok} fail=${fail} • +${chunkRows} rows • total=${totalWritten}`,
+    )
+
+    if (chunkDelay > 0) await sleep(chunkDelay)
+  }
+
+  console.log(`\n✅ Done. Total new rows written: ${totalWritten} → ${outPath}`)
 }
 
-const args = process.argv.slice(2).reduce((acc, arg) => {
-  const [key, value] = arg.split('=')
-  acc[key.replace('--', '')] = value
-  return acc
-}, {} as Record<string, string>)
-
-const start = args.start || '2025-07-15'
-const end = args.end || '2025-07-29'
-const lookup = args.lookup || 'data/lookup/ca_iot_hotspots.json'
-const limit = Number(args.limit) || 0
-const chunkSize = Number(args.chunkSize) || 3
-const apiKey = args.apiKey || process.env.RELAY_API_KEY || ''
-
-const output = args.output || `iot_${start}_${end}.jsonl`
-
-fetchIotRewards(start, end, lookup, limit, chunkSize, apiKey, output).catch(
-  (e: unknown) => {
-    console.error(e)
-    process.exit(1)
-  },
-)
+main().catch((e) => {
+  console.error('[fatal]', e?.message || e)
+  process.exit(1)
+})

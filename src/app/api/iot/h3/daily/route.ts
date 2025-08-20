@@ -1,157 +1,686 @@
 import {NextRequest, NextResponse} from 'next/server'
-import {tableFromIPC} from 'apache-arrow'
+import {tableFromIPC, Table} from 'apache-arrow'
 import fs from 'node:fs'
 import path from 'node:path'
+import * as ort from 'onnxruntime-node'
+import _ from 'lodash'
+import {cellToLatLng} from 'h3-js'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
+// ---------- CONFIG ----------
 const DEFAULT_ARROW_PATH =
   process.env.IOT_ARROW_FILE ?? 'data/features/iot/ca_iot_daily.arrow'
+const MODELS_DIR = path.join(process.cwd(), 'public', 'models')
 
-type Row = {
-  hex?: string
-  date?: string
-  beacon?: number
-  witness?: number
-  dc_transfer?: number
-  total_rewards?: number
+// Halving awareness (UTC, month is 0-based → 7 = August)
+const HALVING_DATE_UTC = Date.UTC(2025, 7, 1)
+
+const EPSILON = 1e-6
+
+// ---------- CACHES ----------
+let session: ort.InferenceSession | null = null
+let featTotal: string[] | null = null
+
+let blendWeights: Record<number, number> | null = null // {h: weight}, 1-based horizon
+let conformalWidths: Record<number, number> | null = null // {h: width}, 1-based horizon
+let bandFallback: {p10: number; p90: number} | null = null
+
+let tableCache: Table | null = null
+let hexDataCache: Record<string, any[]> | null = null
+
+// network mean per UTC day (ms @ 00:00), for net_mean_lag1 / net_ma3_lag
+let netMeanByDay: Map<number, {sum: number; n: number}> | null = null
+let globalMeanTotal = 0
+let globalStdAccum = 0
+let globalCount = 0
+
+// ---------- TYPES ----------
+type Row = any
+type ModeledRow = Row & {
   poc_rewards?: number
-  hotspot_count?: number
-  density_k1?: number
-  ma_3d_total?: number
-  ma_3d_poc?: number
-  transmit_scale_approx?: number
+  dc_rewards?: number
+  total_rewards?: number
+  forecasted_total?: number
+  forecasted_poc?: number
+  forecasted_dc?: number
+  lower_band?: number
+  upper_band?: number
 }
 
-function asString(v: unknown): string | undefined {
-  return v == null ? undefined : String(v)
+// ---------- SMALL UTILS ----------
+const clamp = (x: number, lo = 0, hi = 1) => Math.min(hi, Math.max(lo, x))
+const day0 = (d: Date | number) => {
+  const t = typeof d === 'number' ? d : d.getTime()
+  const dd = new Date(t)
+  dd.setUTCHours(0, 0, 0, 0)
+  return dd.getTime()
+}
+function mean(arr: number[]) {
+  return arr.length ? _.mean(arr) : 0
+}
+function stddev(arr: number[]) {
+  if (arr.length <= 1) return 0
+  const m = mean(arr)
+  return Math.sqrt(mean(arr.map((v) => (v - m) ** 2)))
+}
+function rollingMean(values: number[], window: number) {
+  if (!values.length) return 0
+  const slice = values.slice(-window)
+  return mean(slice)
+}
+function dayFeaturesUTC(d: Date) {
+  const dow = d.getUTCDay()
+  const month = d.getUTCMonth() + 1
+  const quarter = Math.floor((month - 1) / 3) + 1
+  const jan1 = Date.UTC(d.getUTCFullYear(), 0, 1)
+  const diffDays = Math.floor((d.getTime() - jan1) / 86400000)
+  const week = Math.max(1, Math.floor((diffDays + 4) / 7))
+  return {
+    day_of_week: dow,
+    week,
+    month,
+    quarter,
+    sin_dow: Math.sin((2 * Math.PI * dow) / 7),
+    cos_dow: Math.cos((2 * Math.PI * dow) / 7),
+    sin_woy: Math.sin((2 * Math.PI * week) / 52),
+    cos_woy: Math.cos((2 * Math.PI * week) / 52),
+    sin_month: Math.sin((2 * Math.PI * month) / 12),
+    cos_month: Math.cos((2 * Math.PI * month) / 12),
+  }
+}
+function seasonalNaiveLag7(history: Row[]) {
+  const lag7 = history[history.length - 8]?.total_rewards
+  const last = history[history.length - 1]?.total_rewards ?? 0
+  const lag1 = history[history.length - 2]?.total_rewards ?? last
+  return Number.isFinite(lag7) ? Number(lag7) : Number(lag1)
+}
+function seasonalMeanForDOW(history: Row[], dow: number) {
+  // Average totals that fell on this DOW over last ~28 days (fallback to lag7)
+  const cutoff = Math.max(0, history.length - 28)
+  const vals: number[] = []
+  for (let i = cutoff; i < history.length; i++) {
+    const r = history[i]
+    const d = new Date(r.date)
+    if (d.getUTCDay() === dow) vals.push(Number(r.total_rewards ?? 0))
+  }
+  if (vals.length >= 2) return mean(vals)
+  return seasonalNaiveLag7(history)
+}
+function pocShareEMA(history: Row[], span = 7) {
+  const alpha = 2 / (span + 1)
+  let ema = 0.5
+  let seeded = false
+  const start = Math.max(0, history.length - 30)
+  for (let i = start; i < history.length; i++) {
+    const r = history[i]
+    const total = Number(r.total_rewards ?? 0)
+    const share =
+      total > 0 ? Number(r.poc_rewards ?? 0) / total : seeded ? ema : 0.5
+    ema = seeded ? alpha * share + (1 - alpha) * ema : share
+    seeded = true
+  }
+  return clamp(ema, 0, 1)
+}
+function netMean(dayMillis: number) {
+  if (!netMeanByDay) return 0
+  const rec = netMeanByDay.get(dayMillis)
+  return rec && rec.n > 0 ? rec.sum / rec.n : 0
+}
+function netMA3Lag(dayMillis: number) {
+  const d1 = dayMillis
+  const d2 = d1 - 86400000
+  const d3 = d2 - 86400000
+  return mean([netMean(d1), netMean(d2), netMean(d3)])
 }
 
-function asNumber(v: unknown): number | undefined {
-  if (v == null) return undefined
-  const n = Number(v)
-  return Number.isFinite(n) ? n : undefined
+// ---------- LOADERS ----------
+async function loadDataAndModels() {
+  // Model + features
+  if (!session) {
+    console.log('Loading ONNX model (single advanced-lite)…')
+    const totalPath = path.join(MODELS_DIR, 'iot_total_adj_predictor_q0.5.onnx')
+    session = await ort.InferenceSession.create(totalPath)
+    console.log('Loaded ONNX.')
+  }
+  if (!featTotal) {
+    const featsPath = path.join(MODELS_DIR, 'total_adj_features.json')
+    featTotal = JSON.parse(fs.readFileSync(featsPath, 'utf8'))
+    console.log(`Loaded feature list (total=${featTotal.length})`)
+  }
+
+  // Horizon weights / bands (optional; fall back to defaults)
+  if (!blendWeights) {
+    try {
+      blendWeights = JSON.parse(
+        fs.readFileSync(path.join(MODELS_DIR, 'blend_weights.json'), 'utf8'),
+      )
+    } catch {
+      blendWeights = {1: 0.9, 2: 0.8, 3: 0.7, 4: 0.6}
+    }
+  }
+  if (!conformalWidths) {
+    try {
+      conformalWidths = JSON.parse(
+        fs.readFileSync(path.join(MODELS_DIR, 'conformal_widths.json'), 'utf8'),
+      )
+    } catch {
+      conformalWidths = null
+      try {
+        bandFallback = JSON.parse(
+          fs.readFileSync(path.join(MODELS_DIR, 'residual_band.json'), 'utf8'),
+        )
+      } catch {
+        bandFallback = {p10: -0.5, p90: 0.5} // safe-ish default band
+      }
+    }
+  }
+
+  // Arrow + per-hex cache + per-day net means
+  if (!tableCache || !hexDataCache || !netMeanByDay) {
+    console.log('Loading Arrow data…')
+    const absolute = path.resolve(DEFAULT_ARROW_PATH)
+    if (!fs.existsSync(absolute)) {
+      throw new Error(`Arrow file not found: ${absolute}`)
+    }
+    const buf = fs.readFileSync(absolute)
+    tableCache = tableFromIPC(buf)
+
+    const allRows = tableCache.toArray().map((r) => {
+      const d: any = {...r}
+      // normalize data field & neighbor fallback (compat)
+      if (d.dc_transfer != null && d.dc_rewards == null)
+        d.dc_rewards = d.dc_transfer
+      if (d.neighbor_ma3_total == null && d.neighbor_ma7_total != null)
+        d.neighbor_ma3_total = d.neighbor_ma7_total
+
+      const t = new Date(d.date).getTime()
+      const day = day0(t)
+      const total =
+        Number(d.total_rewards ?? 0) ||
+        Number(d.poc_rewards ?? 0) + Number(d.dc_rewards ?? 0)
+
+      // global stats accumulators
+      globalMeanTotal += total
+      globalStdAccum += total * total
+      globalCount += 1
+
+      return {...d, date: day}
+    })
+
+    // per-hex history
+    hexDataCache = _.groupBy(allRows, 'hex')
+    for (const hex in hexDataCache) {
+      hexDataCache[hex] = _.sortBy(hexDataCache[hex], 'date')
+    }
+
+    // network mean per day
+    netMeanByDay = new Map()
+    for (const r of allRows) {
+      const day = r.date
+      const tot =
+        Number(r.total_rewards ?? 0) ||
+        Number(r.poc_rewards ?? 0) + Number(r.dc_rewards ?? 0)
+      const cur = netMeanByDay.get(day)
+      if (cur) {
+        cur.sum += tot
+        cur.n += 1
+      } else {
+        netMeanByDay.set(day, {sum: tot, n: 1})
+      }
+    }
+    console.log('Loaded hexes:', Object.keys(hexDataCache).length)
+  }
+}
+
+// ---------- FEATURE BUILDER FOR SINGLE MODEL ----------
+function buildFeatureDict(
+  hexId: string,
+  history: Row[],
+  currentDate: Date,
+  policy?: {densityMult?: number; txScaleMult?: number},
+) {
+  const last = history[history.length - 1] || {}
+
+  // Halving regime
+  const isPost = currentDate.getTime() >= HALVING_DATE_UTC
+  const daysSinceHalving = Math.max(
+    0,
+    Math.floor((day0(currentDate) - HALVING_DATE_UTC) / 86400000),
+  )
+
+  // short lags & MAs (computed from history only -> leak-safe)
+  const totals = history.map((r) => Number(r.total_rewards ?? 0))
+  const lag1 = totals[totals.length - 1] ?? 0
+  const lag2 = totals[totals.length - 2] ?? lag1
+  const lag3 = totals[totals.length - 3] ?? lag2
+  const ma3 = mean(totals.slice(-3))
+  const ma7 = mean(totals.slice(-7))
+  const vol7 = stddev(totals.slice(-7))
+  const rsi7 = (() => {
+    const diffs = []
+    for (let i = Math.max(0, totals.length - 8); i < totals.length - 1; i++) {
+      diffs.push(totals[i + 1] - totals[i])
+    }
+    const gains = diffs.filter((d) => d > 0)
+    const losses = diffs.filter((d) => d < 0).map((d) => -d)
+    const avgGain = mean(gains) || 0
+    const avgLoss = mean(losses) || 0
+    const rs = avgLoss > 0 ? avgGain / avgLoss : 0
+    return 100 - 100 / (1 + rs)
+  })()
+  const reward_cv = ma7 > 0 ? vol7 / ma7 : 0
+  const lag1_div_ma3 = ma3 > 0 ? lag1 / ma3 : 0
+
+  // seasonal / naïve anchor (current-day DOW)
+  const {
+    day_of_week,
+    week,
+    month,
+    quarter,
+    sin_dow,
+    cos_dow,
+    sin_woy,
+    cos_woy,
+    sin_month,
+    cos_month,
+  } = dayFeaturesUTC(currentDate)
+  const seasonal_mean = seasonalMeanForDOW(history, day_of_week)
+  const naive_blend =
+    0.8 * (0.5 * lag1 + 0.3 * lag2 + 0.2 * lag3) + 0.2 * seasonal_mean
+
+  // policy-adjusted statics
+  const density =
+    Number(last.density_k1 ?? 0) * Number(policy?.densityMult ?? 1)
+  const txscale =
+    Number(last.transmit_scale_approx ?? 0) * Number(policy?.txScaleMult ?? 1)
+
+  // neighbor + network context
+  const neighbor_ma3_total = Number(last.neighbor_ma3_total ?? 0)
+  const yday = day0(new Date(currentDate.getTime() - 86400000))
+  const net_mean_lag1 = netMean(yday)
+  const net_ma3_lag = netMA3Lag(yday)
+
+  // per-hex fixed effects ~ train-only mean/std (estimate from recent)
+  const recent = totals.slice(-28)
+  const hex_mean_train_total =
+    recent.length >= 5
+      ? mean(recent)
+      : globalCount
+      ? globalMeanTotal / globalCount
+      : 0
+  const hex_std_train_total =
+    recent.length >= 5
+      ? stddev(recent)
+      : globalCount
+      ? Math.sqrt(
+          globalStdAccum / globalCount - (globalMeanTotal / globalCount) ** 2,
+        )
+      : 0
+
+  // composition proxy from lag1 (if present)
+  const poc_share_lag1 =
+    lag1 > 0
+      ? Number(last.poc_rewards ?? 0) / Number(last.total_rewards ?? lag1)
+      : 0
+
+  // Compose features dictionary
+  const f: Record<string, number | string> = {
+    // core anchors & short history
+    naive_blend,
+    lag1_total: lag1,
+    lag2_total: lag2,
+    lag3_total: lag3,
+    ma_3d_total: ma3,
+    lag1_div_ma3,
+
+    // composition/volatility/trend proxies
+    poc_share_lag1,
+    trend_7d: (() => {
+      const xs = totals.slice(-7)
+      if (xs.length <= 1) return 0
+      const x = xs.map((_, i) => i)
+      const xm = mean(x)
+      const ym = mean(xs)
+      const denom = x.reduce((s, v) => s + (v - xm) ** 2, 0)
+      if (denom === 0) return 0
+      const num = xs.reduce((s, v, i) => s + (i - xm) * (v - ym), 0)
+      return num / denom
+    })(),
+    volatility_7d: vol7,
+    rsi_7d: rsi7,
+    reward_cv,
+
+    // neighbor & network
+    neighbor_ma3_total,
+    net_mean_lag1,
+    net_ma3_lag,
+
+    // calendar & regime
+    day_of_week,
+    sin_dow,
+    cos_dow,
+    week,
+    sin_woy,
+    cos_woy,
+    month,
+    sin_month,
+    cos_month,
+    quarter,
+    is_post_halving: isPost ? 1 : 0,
+    days_since_halving: daysSinceHalving,
+
+    // deployment & density
+    hotspot_count: Number(last.hotspot_count ?? 0),
+    density_k1: density,
+    transmit_scale_approx: txscale,
+
+    // fixed effects & seasonal level
+    hex_mean_train_total,
+    hex_std_train_total,
+    seasonal_mean,
+
+    // identifiers the model may ignore (safe to include)
+    hex: hexId,
+  }
+
+  return f
+}
+
+function tensorFromOrder(
+  order: string[],
+  dict: Record<string, number | string>,
+) {
+  // Any missing features become 0; extra keys ignored.
+  const arr = Float32Array.from(order.map((k) => Number(dict[k] ?? 0)))
+  return new ort.Tensor('float32', arr, [1, order.length])
+}
+
+// naive blend for *next* day (for multiplicative anchoring)
+function naiveBlendNextDay(history: Row[], currentDate: Date) {
+  const totals = history.map((r) => Number(r.total_rewards ?? 0))
+  const lag1 = totals[totals.length - 1] ?? 0
+  const lag2 = totals[totals.length - 2] ?? lag1
+  const lag3 = totals[totals.length - 3] ?? lag2
+  const nextDOW = (currentDate.getUTCDay() + 1) % 7
+  const seas = seasonalMeanForDOW(history, nextDOW)
+  return 0.8 * (0.5 * lag1 + 0.3 * lag2 + 0.2 * lag3) + 0.2 * seas
 }
 
 export async function GET(req: NextRequest) {
   try {
     const url = new URL(req.url)
-    const hex = url.searchParams.get('hex') ?? undefined
-    const from = url.searchParams.get('from') ?? undefined // YYYY-MM-DD
-    const to = url.searchParams.get('to') ?? undefined // YYYY-MM-DD
+
+    // Governance knobs
+    const densityMult = Number(url.searchParams.get('densityMult') ?? '1')
+    const txScaleMult = Number(url.searchParams.get('txScaleMult') ?? '1')
+    const pocShareOverride = url.searchParams.get('pocShare')
+    const pocShareParam =
+      pocShareOverride != null ? clamp(Number(pocShareOverride), 0, 1) : null
+
+    // Basic filters
+    const hexParam = url.searchParams.get('hex') ?? undefined
+    const from = url.searchParams.get('from') ?? undefined
+    const to = url.searchParams.get('to') ?? undefined
+    const forecast = url.searchParams.get('forecast') === 'true'
     const limit = Number(url.searchParams.get('limit') ?? '5000')
-    const file = url.searchParams.get('file') ?? DEFAULT_ARROW_PATH
-    const absolute = path.resolve(file)
-    if (!fs.existsSync(absolute)) {
-      return NextResponse.json(
-        {ok: false, error: `Arrow file not found: ${absolute}`},
-        {status: 404},
-      )
-    }
+    const horizon = Math.max(1, Number(url.searchParams.get('horizon') ?? '1'))
 
-    const buf = fs.readFileSync(absolute)
-    const table = tableFromIPC(buf)
-
-    const fields = table.schema.fields
-    const colIndex = (n: string) => fields.findIndex((f) => f.name === n)
-    const idx = {
-      hex: colIndex('hex'),
-      date: colIndex('date'),
-      beacon: colIndex('beacon'),
-      witness: colIndex('witness'),
-      dc_transfer: colIndex('dc_transfer'),
-      total_rewards: colIndex('total_rewards'),
-      poc_rewards: colIndex('poc_rewards'),
-      hotspot_count: colIndex('hotspot_count'),
-      density_k1: colIndex('density_k1'),
-      ma_3d_total: colIndex('ma_3d_total'),
-      ma_3d_poc: colIndex('ma_3d_poc'),
-      transmit_scale_approx: colIndex('transmit_scale_approx'),
-    }
-
-    const get = (i: number, c: number) => table.getChildAt(c)?.get(i)
-
-    const rows: Row[] = []
-    const pushRow = (i: number) => {
-      const r: Row = {
-        hex: asString(idx.hex >= 0 ? get(i, idx.hex) : undefined),
-        date: asString(idx.date >= 0 ? get(i, idx.date) : undefined),
-        beacon: asNumber(idx.beacon >= 0 ? get(i, idx.beacon) : undefined),
-        witness: asNumber(idx.witness >= 0 ? get(i, idx.witness) : undefined),
-        dc_transfer: asNumber(
-          idx.dc_transfer >= 0 ? get(i, idx.dc_transfer) : undefined,
-        ),
-        total_rewards: asNumber(
-          idx.total_rewards >= 0 ? get(i, idx.total_rewards) : undefined,
-        ),
-        poc_rewards: asNumber(
-          idx.poc_rewards >= 0 ? get(i, idx.poc_rewards) : undefined,
-        ),
-        hotspot_count: asNumber(
-          idx.hotspot_count >= 0 ? get(i, idx.hotspot_count) : undefined,
-        ),
-        density_k1: asNumber(
-          idx.density_k1 >= 0 ? get(i, idx.density_k1) : undefined,
-        ),
-        ma_3d_total: asNumber(
-          idx.ma_3d_total >= 0 ? get(i, idx.ma_3d_total) : undefined,
-        ),
-        ma_3d_poc: asNumber(
-          idx.ma_3d_poc >= 0 ? get(i, idx.ma_3d_poc) : undefined,
-        ),
-        transmit_scale_approx: asNumber(
-          idx.transmit_scale_approx >= 0
-            ? get(i, idx.transmit_scale_approx)
-            : undefined,
-        ),
+    // polygon lasso
+    const polyRaw = url.searchParams.get('poly')
+    let lassoPoly: [number, number][] | null = null
+    if (polyRaw) {
+      try {
+        lassoPoly = JSON.parse(polyRaw)
+      } catch {
+        lassoPoly = null
       }
-      rows.push(r)
     }
 
-    const inRange = (d?: string) => {
-      if (!d) return true
-      if (from && d < from) return false
-      if (to && d > to) return false
-      return true
+    await loadDataAndModels()
+    if (!session || !featTotal || !hexDataCache) {
+      throw new Error('Initialization failed')
     }
 
-    for (let i = 0; i < table.numRows && rows.length < limit; i++) {
-      const currentHex = asString(idx.hex >= 0 ? get(i, idx.hex) : undefined)
-      if (hex && currentHex !== hex) continue
-
-      const d = asString(idx.date >= 0 ? get(i, idx.date) : undefined)
-      if (d && !inRange(d)) continue
-
-      pushRow(i)
+    if (url.searchParams.get('debug') === '1') {
+      return NextResponse.json({
+        ok: true,
+        model: 'advanced-lite: single total (residual-over-naive)',
+        blendWeights: blendWeights,
+        hasConformalWidths: Boolean(conformalWidths),
+        bandFallback: bandFallback,
+        scalarToday: Date.now() >= HALVING_DATE_UTC ? 0.5 : 1.0,
+      })
     }
 
-    const sum = (key: keyof Row) =>
-      rows.reduce(
-        (s, r) => s + (typeof r[key] === 'number' ? (r[key] as number) : 0),
-        0,
-      )
-    const totals = {
-      beacon: sum('beacon'),
-      witness: sum('witness'),
-      dc_transfer: sum('dc_transfer'),
-      total_rewards: sum('total_rewards'),
-      poc_rewards: sum('poc_rewards'),
-      hotspot_count: sum('hotspot_count'),
-      density_k1: sum('density_k1'),
-      ma_3d_total: sum('ma_3d_total'),
-      ma_3d_poc: sum('ma_3d_poc'),
-      rows: rows.length,
+    // Restrict hex set by polygon if provided
+    let eligibleHexes: string[] | null = null
+    if (lassoPoly && lassoPoly.length >= 3) {
+      const selected: string[] = []
+      for (const hexId of Object.keys(hexDataCache)) {
+        const [clat, clon] = cellToLatLng(hexId)
+        // pointInPolygon (ray-cast)
+        let inside = false
+        for (
+          let i = 0, j = lassoPoly.length - 1;
+          i < lassoPoly.length;
+          j = i++
+        ) {
+          const xi = lassoPoly[i][0],
+            yi = lassoPoly[i][1]
+          const xj = lassoPoly[j][0],
+            yj = lassoPoly[j][1]
+          const intersect =
+            yi > clon !== yj > clon &&
+            clat < ((xj - xi) * (clon - yi)) / (yj - yi || 1e-12) + xi
+          if (intersect) inside = !inside
+        }
+        if (inside) selected.push(hexId)
+      }
+      eligibleHexes = selected
     }
+
+    let outputRows: ModeledRow[] = []
+
+    if (forecast) {
+      const explicitHexes =
+        hexParam
+          ?.split(',')
+          .map((s) => s.trim())
+          .filter(Boolean) ?? []
+
+      const hexes =
+        eligibleHexes && eligibleHexes.length
+          ? eligibleHexes
+          : explicitHexes.length
+          ? explicitHexes
+          : []
+
+      if (hexes.length === 0) {
+        return NextResponse.json({
+          ok: true,
+          filters: {
+            hex: hexParam,
+            from,
+            to,
+            forecast,
+            limit,
+            horizon,
+            poly: !!lassoPoly,
+          },
+          rows: [],
+          totals: {rows: 0, poc_rewards: 0, dc_rewards: 0, total_rewards: 0},
+        })
+      }
+
+      // Target date defaults to today at 00:00 UTC (or "to" date)
+      let targetDate = to ? new Date(to) : new Date()
+      targetDate.setUTCHours(0, 0, 0, 0)
+
+      // Horizon weights / bands
+      const wSched = blendWeights ?? {1: 0.9, 2: 0.8, 3: 0.7, 4: 0.6}
+
+      const baseWidthFor = (h: number, scalar: number) => {
+        if (conformalWidths && conformalWidths[h] != null) {
+          return conformalWidths[h] * scalar
+        }
+        const width = bandFallback
+          ? 0.5 * Math.abs(bandFallback.p90 - bandFallback.p10)
+          : 0
+        return width * scalar
+      }
+
+      for (const hexId of hexes) {
+        const full = (hexDataCache[hexId] || []).slice()
+        if (full.length === 0) continue
+
+        // ---- Anchor history to the day BEFORE target (no future leakage) ----
+        const cutoff = new Date(targetDate)
+        cutoff.setUTCDate(cutoff.getUTCDate() - 1)
+        const cutoffMs = day0(cutoff)
+
+        let history = full.filter((r) => r.date <= cutoffMs)
+        if (history.length === 0) {
+          // seed with earliest window if nothing before target
+          history = full.slice(0, Math.min(14, full.length))
+        }
+        // ---------------------------------------------------------------------
+
+        const forecasts: ModeledRow[] = []
+        let currentDate = new Date(targetDate)
+
+        for (let step = 0; step < horizon; step++) {
+          const lastKnownDay = history[history.length - 1]
+
+          // Build features for this day (current DOW), include policy multipliers
+          const featureDict = buildFeatureDict(hexId, history, currentDate, {
+            densityMult,
+            txScaleMult,
+          })
+          const totalIn = tensorFromOrder(featTotal, featureDict)
+          const out = await session.run({input: totalIn})
+          const corr = (Object.values(out)[0].data as Float32Array)[0] // log correction
+
+          // Anchored to NEXT-day naive blend
+          const naiveNext = naiveBlendNextDay(history, currentDate)
+          let modelMedian = Math.max(
+            0,
+            (naiveNext + EPSILON) * Math.exp(corr) - EPSILON,
+          )
+
+          // Blend vs naiveNext for stability by horizon
+          const h = step + 1
+          const w = wSched[h] ?? 0.6
+          const blended = w * modelMedian + (1 - w) * naiveNext
+
+          // Bands: scale by halving regime + mild horizon growth
+          const scalar = currentDate.getTime() >= HALVING_DATE_UTC ? 0.5 : 1.0
+          const baseWidth = baseWidthFor(h, scalar)
+          const width = baseWidth * (1 + 0.05 * Math.sqrt(h))
+          const lower = Math.max(blended - width, 0)
+          const upper = blended + width
+
+          // Split total into PoC/Data
+          const sBase =
+            pocShareParam != null ? pocShareParam : pocShareEMA(history)
+          const poc = blended * sBase
+          const data = blended - poc
+
+          const predictedRow: ModeledRow = {
+            ...lastKnownDay,
+            hex: hexId,
+            date: day0(currentDate),
+            poc_rewards: poc,
+            dc_rewards: data,
+            total_rewards: blended,
+            forecasted_poc: poc,
+            forecasted_dc: data,
+            forecasted_total: blended,
+            lower_band: lower,
+            upper_band: upper,
+          }
+
+          forecasts.push(predictedRow)
+          history.push(predictedRow)
+
+          // advance day
+          currentDate = new Date(currentDate)
+          currentDate.setUTCDate(currentDate.getUTCDate() + 1)
+        }
+
+        outputRows.push(...forecasts)
+      }
+
+      outputRows = outputRows.slice(0, limit)
+    } else {
+      // Historical passthrough (filters)
+      const fromTime = from ? day0(new Date(from)) : -Infinity
+      const toTime = to ? day0(new Date(to)) : Infinity
+
+      let allHistoricalRows = Object.values(hexDataCache!).flat()
+      if (eligibleHexes) {
+        const allowed = new Set(eligibleHexes)
+        allHistoricalRows = allHistoricalRows.filter((r) => allowed.has(r.hex))
+      }
+      if (hexParam) {
+        const only = new Set(
+          hexParam
+            .split(',')
+            .map((s) => s.trim())
+            .filter(Boolean),
+        )
+        allHistoricalRows = allHistoricalRows.filter((r) => only.has(r.hex))
+      }
+
+      outputRows = allHistoricalRows
+        .filter((r) => r.date >= fromTime && r.date <= toTime)
+        .slice(0, limit)
+    }
+
+    const finalRows = outputRows.map((r) => ({
+      ...r,
+      poc_rewards: Number(r.poc_rewards ?? 0),
+      dc_rewards: Number(r.dc_rewards ?? 0),
+      total_rewards: Number(r.total_rewards ?? 0),
+      date: new Date(r.date).toISOString().split('T')[0], // yyyy-mm-dd
+    }))
+
+    // quick totals
+    const totals = (() => {
+      const acc = {
+        rows: finalRows.length,
+        poc_rewards: 0,
+        dc_rewards: 0,
+        total_rewards: 0,
+      }
+      for (const r of finalRows) {
+        acc.poc_rewards += Number(r.poc_rewards ?? r.forecasted_poc ?? 0)
+        acc.dc_rewards += Number(r.dc_rewards ?? r.forecasted_dc ?? 0)
+        acc.total_rewards += Number(r.total_rewards ?? r.forecasted_total ?? 0)
+      }
+      return acc
+    })()
 
     return NextResponse.json({
       ok: true,
-      file: absolute,
-      filters: {hex, from, to, limit},
+      filters: {
+        hex: hexParam,
+        from,
+        to,
+        forecast,
+        limit,
+        horizon,
+        poly: Boolean(lassoPoly),
+        densityMult,
+        txScaleMult,
+        pocShare: pocShareOverride ?? null,
+      },
+      rows: finalRows,
       totals,
-      rows,
     })
   } catch (e: any) {
+    console.error('API Error:', e)
     return NextResponse.json(
       {ok: false, error: e?.message ?? 'unknown error'},
       {status: 500},
