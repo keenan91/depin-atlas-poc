@@ -448,7 +448,7 @@ export default function MapCanvas() {
         map?._panes?.overlayPane?.querySelector('svg') || null
       if (!svg) return
       svg.classList.add('reveal')
-      void svg.offsetWidth
+      void svg.getBoundingClientRect().width
       svg.classList.add('run')
       setTimeout(() => {
         svg.classList.remove('run')
