@@ -110,7 +110,7 @@ export default function LassoLayer({
         hintRef.current = null
       }, 3000)
     }
-    showHint()
+    // showHint()
 
     const onDown = (e: L.LeafletMouseEvent) => {
       hintRef.current?.remove()
