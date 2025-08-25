@@ -1,0 +1,3 @@
+[functions]
+  # include the dataset in the lambda bundle
+  included_files = ["data/features/iot/ca_iot_daily.arrow"]
