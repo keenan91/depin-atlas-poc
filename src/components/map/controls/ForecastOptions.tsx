@@ -26,9 +26,11 @@ export default function ForecastOptions({
   const [prevPoc, setPrevPoc] = useState(poc)
   const [prevData, setPrevData] = useState(data)
   const [isValueChanging, setIsValueChanging] = useState(false)
-  const pocTimeoutRef = useRef<NodeJS.Timeout>()
-  const dataTimeoutRef = useRef<NodeJS.Timeout>()
-  const valueTimeoutRef = useRef<NodeJS.Timeout>()
+
+  // Use DOM-friendly timer types and initialize to null
+  const pocTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const dataTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const valueTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     if (poc !== prevPoc) {
@@ -57,6 +59,15 @@ export default function ForecastOptions({
       valueTimeoutRef.current = setTimeout(() => setIsValueChanging(false), 300)
     }
   }, [data, prevData])
+
+  // Cleanup timers on unmount
+  useEffect(() => {
+    return () => {
+      if (pocTimeoutRef.current) clearTimeout(pocTimeoutRef.current)
+      if (dataTimeoutRef.current) clearTimeout(dataTimeoutRef.current)
+      if (valueTimeoutRef.current) clearTimeout(valueTimeoutRef.current)
+    }
+  }, [])
 
   const handleReset = () => {
     onPoc(1)

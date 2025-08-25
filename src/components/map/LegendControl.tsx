@@ -116,120 +116,47 @@ export default function LegendControl({cuts, field, palette, mode}: Props) {
           transform: translateY(-2px);
         }
         
-        .legend-container {
-          padding: 16px;
-        }
-        
+        .legend-container { padding: 16px; }
         .legend-header {
-          display: flex;
-          align-items: center;
-          justify-content: space-between;
-          margin-bottom: 12px;
-          padding-bottom: 12px;
+          display: flex; align-items: center; justify-content: space-between;
+          margin-bottom: 12px; padding-bottom: 12px;
           border-bottom: 1px solid rgba(148, 163, 184, 0.1);
         }
-        
-        .legend-title {
-          font-size: 14px;
-          font-weight: 600;
-          margin: 0;
-          color: var(--text-primary, rgba(248, 250, 252, 0.95));
-        }
-        
+        .legend-title { font-size: 14px; font-weight: 600; margin: 0; color: var(--text-primary, rgba(248, 250, 252, 0.95)); }
         .legend-mode-tag {
-          font-size: 10px;
-          padding: 3px 8px;
-          border-radius: 999px;
+          font-size: 10px; padding: 3px 8px; border-radius: 999px;
           background: linear-gradient(135deg, rgba(139, 92, 246, 0.15) 0%, rgba(139, 92, 246, 0.1) 100%);
-          border: 1px solid rgba(139, 92, 246, 0.3);
-          color: var(--accent-light, #a78bfa);
-          font-weight: 500;
-          text-transform: uppercase;
-          letter-spacing: 0.03em;
+          border: 1px solid rgba(139, 92, 246, 0.3); color: var(--accent-light, #a78bfa);
+          font-weight: 500; text-transform: uppercase; letter-spacing: 0.03em;
         }
-        
-        .legend-list {
-          list-style: none;
-          margin: 0;
-          padding: 0;
-          display: flex;
-          flex-direction: column;
-          gap: 8px;
-        }
-        
-        .legend-item {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-          transition: all 0.15s ease-out;
-          padding: 4px;
-          border-radius: 8px;
-          margin: 0 -4px;
-        }
-        
-        .legend-item:hover {
-          background: rgba(139, 92, 246, 0.05);
-        }
-        
-        .legend-swatch {
-          width: 20px;
-          height: 20px;
-          flex-shrink: 0;
-          filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.2));
-          transition: transform 0.15s ease-out;
-        }
-        
-        .legend-item:hover .legend-swatch {
-          transform: scale(1.1);
-        }
-        
-        .legend-label {
-          font-size: 12px;
-          color: var(--text-secondary, rgba(203, 213, 225, 0.8));
-          line-height: 1.4;
-        }
-        
-        .legend-info {
-          margin-top: 12px;
-          padding-top: 12px;
-          border-top: 1px solid rgba(148, 163, 184, 0.08);
-          display: flex;
-          flex-direction: column;
-          gap: 6px;
-        }
-        
-        .legend-info-item {
-          display: flex;
-          align-items: center;
-          gap: 8px;
-          font-size: 11px;
-          color: var(--text-muted, rgba(148, 163, 184, 0.6));
-        }
-        
-        .legend-dash {
-          opacity: 0.7;
-        }
-        
-        .legend-icon {
-          opacity: 0.6;
-        }
+        .legend-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+        .legend-item { display: flex; align-items: center; gap: 10px; transition: all 0.15s ease-out; padding: 4px; border-radius: 8px; margin: 0 -4px; }
+        .legend-item:hover { background: rgba(139, 92, 246, 0.05); }
+        .legend-swatch { width: 20px; height: 20px; flex-shrink: 0; filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.2)); transition: transform 0.15s ease-out; }
+        .legend-item:hover .legend-swatch { transform: scale(1.1); }
+        .legend-label { font-size: 12px; color: var(--text-secondary, rgba(203, 213, 225, 0.8)); line-height: 1.4; }
+        .legend-info { margin-top: 12px; padding-top: 12px; border-top: 1px solid rgba(148, 163, 184, 0.08); display: flex; flex-direction: column; gap: 6px; }
+        .legend-info-item { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--text-muted, rgba(148, 163, 184, 0.6)); }
+        .legend-dash { opacity: 0.7; }
+        .legend-icon { opacity: 0.6; }
       `
       document.head.appendChild(style)
     }
 
-    const control = L.control({position: 'bottomright'})
-    control.onAdd = () => {
+    // ✅ Construct via class to satisfy TS in some Leaflet type bundles
+    const ctrl = new L.Control({position: 'bottomright'})
+    ctrl.onAdd = () => {
       const div = L.DomUtil.create('div', 'legend') as HTMLElement
       L.DomEvent.disableClickPropagation(div)
       div.innerHTML = renderHtml()
       containerRef.current = div
       return div
     }
-    control.addTo(map)
-    controlRef.current = control
+    ctrl.addTo(map)
+    controlRef.current = ctrl
 
     return () => {
-      control.remove()
+      map.removeControl(ctrl)
       controlRef.current = null
       containerRef.current = null
     }

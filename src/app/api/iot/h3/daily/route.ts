@@ -147,7 +147,6 @@ async function loadDataAndModels() {
   if (!featTotal) {
     const featsPath = path.join(MODELS_DIR, 'total_adj_features.json')
     featTotal = JSON.parse(fs.readFileSync(featsPath, 'utf8'))
-    console.log(`Loaded feature list (total=${featTotal.length})`)
   }
 
   // Horizon weights / bands (optional; fall back to defaults)

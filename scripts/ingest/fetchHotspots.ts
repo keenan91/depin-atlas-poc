@@ -3,7 +3,7 @@
 
 import fs from 'fs/promises'
 import path from 'path'
-import fetch from 'node-fetch'
+// import fetch from 'node-fetch'
 
 async function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
