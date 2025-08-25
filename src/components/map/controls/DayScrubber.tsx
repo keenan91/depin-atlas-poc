@@ -1,6 +1,7 @@
 'use client'
 
 import React, {useEffect} from 'react'
+import type {Dispatch, SetStateAction} from 'react'
 
 export default function DayScrubber({
   perDay,
@@ -15,7 +16,7 @@ export default function DayScrubber({
   perDay: boolean
   onPerDay: (v: boolean) => void
   day: number
-  onDay: (v: number) => void
+  onDay: Dispatch<SetStateAction<number>> // <-- accept functional updates
   horizon: number
   playing: boolean
   onTogglePlay: () => void
