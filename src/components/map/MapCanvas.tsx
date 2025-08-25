@@ -100,11 +100,9 @@ const MapSkeleton = () => (
 )
 const AnimatedStat = ({
   value,
-  label,
   suffix = '',
 }: {
   value: number
-  label: string
   suffix?: string
 }) => {
   const props = useSpring({
