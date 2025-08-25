@@ -454,10 +454,16 @@ export default function Inspector({
                 <AreaChart
                   data={series}
                   margin={{top: 10, right: 12, left: 0, bottom: 0}}
-                  onClick={(e) => {
-                    if (e && e.activeTooltipIndex !== undefined) {
-                      setSelectedPoint(e.activeTooltipIndex)
-                    }
+                  onClick={(e: unknown) => {
+                    const raw = (e as {activeTooltipIndex?: number | string})
+                      ?.activeTooltipIndex
+                    const idx =
+                      typeof raw === 'number'
+                        ? raw
+                        : typeof raw === 'string'
+                        ? Number(raw)
+                        : NaN
+                    if (Number.isFinite(idx)) setSelectedPoint(idx)
                   }}
                 >
                   <defs>
