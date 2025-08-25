@@ -42,6 +42,8 @@ next-env.d.ts
 
 data/raw/*
 data/features/*
+!data/features/iot
+!data/features/iot/ca_iot_daily.arrow
 !data/features/iot_daily_sample.arrow
 
 data/features/*.arrow
