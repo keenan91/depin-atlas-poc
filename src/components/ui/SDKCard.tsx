@@ -1,20 +1,16 @@
-import * as React from 'react'
+// src/components/ui/SDKCard.tsx
 import {Check} from 'lucide-react'
 
 type SDKCardProps = {
   name: string
   title: string
   description: string
-  features: string[]
+  features: ReadonlyArray<string> // accept readonly arrays
   icon: React.ReactNode
   accent: 'cyan' | 'violet' | 'pink'
   featured?: boolean
-}
-
-const accentRing: Record<SDKCardProps['accent'], string> = {
-  cyan: 'from-cyan-400 to-sky-500',
-  violet: 'from-violet-400 to-fuchsia-500',
-  pink: 'from-pink-400 to-rose-500',
+  /** Optional package label to display instead of @depin-atlas/{name} */
+  pkg?: string
 }
 
 export function SDKCard({
@@ -24,45 +20,55 @@ export function SDKCard({
   features,
   icon,
   featured,
-  accent = 'violet',
+  pkg,
 }: SDKCardProps) {
+  const pkgLabel = pkg ?? `@depin-atlas/${name}`
+
   return (
     <article className="group relative h-full">
+      {/* Featured badge */}
       {featured && (
-        <div className="absolute -top-3 left-1/2 -translate-x-1/2 z-10 px-3.5 py-1 rounded-full text-[10px] font-black tracking-wider uppercase text-white bg-gradient-to-r from-violet-600 to-fuchsia-600 shadow-[0_0_20px_rgba(168,85,247,0.35)]">
+        <div
+          className="absolute -top-3 left-1/2 z-10 -translate-x-1/2 rounded-full 
+                     bg-gradient-to-r from-violet-600 to-purple-600 px-4 py-1 
+                     text-xs font-bold uppercase tracking-wider"
+        >
           Core Technology
         </div>
       )}
 
-      <div className="relative h-full rounded-2xl border border-white/10 bg-black/50 backdrop-blur-xl p-7 hover:border-white/20 hover:bg-black/45 transition">
-        <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/10 to-transparent" />
-
+      {/* Card */}
+      <div
+        className={`
+          relative h-full rounded-2xl border border-white/10 bg-black/40 p-8 
+          backdrop-blur-xl transition-all duration-500 hover:border-violet-500/30 hover:bg-black/50
+          ${featured ? 'lg:scale-[1.02]' : ''}
+        `}
+      >
+        {/* Content */}
         <div className="relative z-10">
-          <div className="mb-6 text-slate-200">{icon}</div>
-          <code className="text-sm text-violet-400/90 font-mono block mb-3">
-            @depin-atlas/{name}
+          {/* Icon */}
+          <div className="mb-6 text-slate-300">{icon}</div>
+
+          {/* Package name */}
+          <code className="mb-4 block font-mono text-sm text-violet-400">
+            {pkgLabel}
           </code>
-          <h3 className="text-xl font-semibold text-white">{title}</h3>
-          <p className="mt-2 text-sm text-slate-400 leading-relaxed">
+
+          {/* Title & Description */}
+          <h3 className="mb-3 text-xl font-bold text-white">{title}</h3>
+          <p className="mb-6 text-sm leading-relaxed text-slate-400">
             {description}
           </p>
 
-          <ul className="mt-6 space-y-3" role="list">
+          {/* Features */}
+          <ul className="space-y-3" role="list">
             {features.map((feature) => (
               <li key={feature} className="flex items-start gap-3">
-                <span
-                  className={[
-                    'mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full',
-                    'bg-gradient-to-br',
-                    accentRing[accent],
-                    'bg-opacity-20/0',
-                  ].join(' ')}
-                >
-                  <span className="h-5 w-5 rounded-full bg-white/10 backdrop-blur-sm flex items-center justify-center">
-                    <Check className="h-3.5 w-3.5 text-white/90" />
-                  </span>
-                </span>
-                <span className="text-slate-200/90 text-sm">{feature}</span>
+                <div className="mt-0.5 flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full bg-violet-500/20">
+                  <Check className="h-3 w-3 text-violet-400" />
+                </div>
+                <span className="text-sm text-slate-300">{feature}</span>
               </li>
             ))}
           </ul>
