@@ -438,7 +438,7 @@ export default function MapCanvas() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, lassoPoly, loading /* byHex length wired below */])
 
-  // Overlay reveal sweep
+  // Overlay reveal sweep (use SVG reflow via getBoundingClientRect for typesafety)
   const runOverlayReveal = useCallback(() => {
     try {
       const map = mapRef.current as any
@@ -825,6 +825,33 @@ export default function MapCanvas() {
     return `linear-gradient(90deg, var(--accent-primary) ${dayPct}%, rgba(148, 163, 184, 0.15) ${dayPct}%)`
   }, [dayPct])
 
+  // ----- NEW: refs to avoid stale closures in map click handler -----
+  const hintRef = useRef(hint)
+  const selectedHexRef = useRef(selectedHex)
+  useEffect(() => {
+    hintRef.current = hint
+  }, [hint])
+  useEffect(() => {
+    selectedHexRef.current = selectedHex
+  }, [selectedHex])
+
+  // ----- NEW: attach Leaflet click handler once per map instance, with cleanup -----
+  useEffect(() => {
+    const m = mapRef.current
+    if (!m) return
+    const handler = () => {
+      if (hintRef.current) setHint(null)
+      if (selectedHexRef.current) {
+        setSelectedHex(null)
+        setHoverHex(null)
+      }
+    }
+    m.on('click', handler)
+    return () => {
+      m.off('click', handler)
+    }
+  }, [mapReady])
+
   return (
     <div className="space-y-3 relative">
       <GlobalStyles />
@@ -1130,9 +1157,11 @@ export default function MapCanvas() {
         </button>
 
         <MapContainer
-          whenCreated={(m: L.Map) => {
+          ref={mapRef as React.MutableRefObject<L.Map | null>}
+          whenReady={() => {
+            const m = mapRef.current
+            if (!m) return
             leafMapCache.map = m
-            mapRef.current = m
             leafMapEpoch += 1
             setMapEpoch(leafMapEpoch)
             setMapReady(true)
@@ -1152,13 +1181,6 @@ export default function MapCanvas() {
               ? 'dim-others'
               : ''
           } ${loading && mode === 'forecast' ? 'loading' : ''}`}
-          onclick={() => {
-            if (hint) setHint(null)
-            if (selectedHex) {
-              setSelectedHex(null)
-              setHoverHex(null)
-            }
-          }}
         >
           <TileLayer
             url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
