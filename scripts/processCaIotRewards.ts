@@ -36,7 +36,7 @@ const REWARDS_FILE = path.resolve(
   argMap.rewards ||
     path.join(
       __dirname,
-      '../data/raw/iot/iot_ca_hotspots_2025-07-01_2025-08-12.jsonl',
+      '../data/raw/iot/iot_ca_hotspots_2025-07-01_2025-08-26.jsonl',
     ),
 )
 const OUTPUT_ARROW_FILE = path.resolve(
