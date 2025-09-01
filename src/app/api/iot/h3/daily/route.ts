@@ -16,18 +16,8 @@ const MODELS_DIR = path.join(process.cwd(), 'public', 'models')
 
 // Halving awareness (UTC, month is 0-based → 7 = August)
 const HALVING_DATE_UTC = Date.UTC(2025, 7, 1)
+
 const EPSILON = 1e-6
-
-const DEFAULT_OBS_SAMPLE_PCT = Number(process.env.IOT_OBS_SAMPLE_PCT ?? '0.12')
-
-function hashUnit(str: string, seed = 1) {
-  let h = (0x811c9dc5 ^ seed) >>> 0
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i)
-    h = Math.imul(h, 0x01000193)
-  }
-  return (h >>> 0) / 4294967296
-}
 
 // ---------- CACHES ----------
 let session: ort.InferenceSession | null = null
@@ -75,6 +65,11 @@ function stddev(arr: number[]) {
   const m = mean(arr)
   return Math.sqrt(mean(arr.map((v) => (v - m) ** 2)))
 }
+function rollingMean(values: number[], window: number) {
+  if (!values.length) return 0
+  const slice = values.slice(-window)
+  return mean(slice)
+}
 function dayFeaturesUTC(d: Date) {
   const dow = d.getUTCDay()
   const month = d.getUTCMonth() + 1
@@ -102,6 +97,7 @@ function seasonalNaiveLag7(history: Row[]) {
   return Number.isFinite(lag7) ? Number(lag7) : Number(lag1)
 }
 function seasonalMeanForDOW(history: Row[], dow: number) {
+  // Average totals that fell on this DOW over last ~28 days (fallback to lag7)
   const cutoff = Math.max(0, history.length - 28)
   const vals: number[] = []
   for (let i = cutoff; i < history.length; i++) {
@@ -114,8 +110,8 @@ function seasonalMeanForDOW(history: Row[], dow: number) {
 }
 function pocShareEMA(history: Row[], span = 7) {
   const alpha = 2 / (span + 1)
-  let ema = 0.5,
-    seeded = false
+  let ema = 0.5
+  let seeded = false
   const start = Math.max(0, history.length - 30)
   for (let i = start; i < history.length; i++) {
     const r = history[i]
@@ -133,22 +129,27 @@ function netMean(dayMillis: number) {
   return rec && rec.n > 0 ? rec.sum / rec.n : 0
 }
 function netMA3Lag(dayMillis: number) {
-  const d1 = dayMillis,
-    d2 = d1 - 86400000,
-    d3 = d2 - 86400000
+  const d1 = dayMillis
+  const d2 = d1 - 86400000
+  const d3 = d2 - 86400000
   return mean([netMean(d1), netMean(d2), netMean(d3)])
 }
 
 // ---------- LOADERS ----------
-async function loadModelsOnly() {
+async function loadDataAndModels() {
+  // Model + features
   if (!session) {
+    console.log('Loading ONNX model (single advanced-lite)…')
     const totalPath = path.join(MODELS_DIR, 'iot_total_adj_predictor_q0.5.onnx')
     session = await ort.InferenceSession.create(totalPath)
+    console.log('Loaded ONNX.')
   }
   if (!featTotal) {
     const featsPath = path.join(MODELS_DIR, 'total_adj_features.json')
     featTotal = JSON.parse(fs.readFileSync(featsPath, 'utf8'))
   }
+
+  // Horizon weights / bands (optional; fall back to defaults)
   if (!blendWeights) {
     try {
       blendWeights = JSON.parse(
@@ -170,67 +171,69 @@ async function loadModelsOnly() {
           fs.readFileSync(path.join(MODELS_DIR, 'residual_band.json'), 'utf8'),
         )
       } catch {
-        bandFallback = {p10: -0.5, p90: 0.5}
+        bandFallback = {p10: -0.5, p90: 0.5} // safe-ish default band
       }
     }
   }
-}
 
-async function loadDataOnly() {
-  if (tableCache && hexDataCache && netMeanByDay) return
-  const absolute = path.resolve(DEFAULT_ARROW_PATH)
-  if (!fs.existsSync(absolute))
-    throw new Error(`Arrow file not found: ${absolute}`)
-  const buf = fs.readFileSync(absolute)
-  tableCache = tableFromIPC(buf)
-
-  const allRows = tableCache.toArray().map((r) => {
-    const d: any = {...r}
-    if (d.dc_transfer != null && d.dc_rewards == null)
-      d.dc_rewards = d.dc_transfer
-    if (d.neighbor_ma3_total == null && d.neighbor_ma7_total != null)
-      d.neighbor_ma3_total = d.neighbor_ma7_total
-    const t = new Date(d.date).getTime()
-    const day = day0(t)
-    const total =
-      Number(d.total_rewards ?? 0) ||
-      Number(d.poc_rewards ?? 0) + Number(d.dc_rewards ?? 0)
-    globalMeanTotal += total
-    globalStdAccum += total * total
-    globalCount += 1
-    return {...d, date: day}
-  })
-
-  hexDataCache = _.groupBy(allRows, 'hex')
-  for (const hex in hexDataCache)
-    hexDataCache[hex] = _.sortBy(hexDataCache[hex], 'date')
-
-  netMeanByDay = new Map()
-  for (const r of allRows) {
-    const day = r.date
-    const tot =
-      Number(r.total_rewards ?? 0) ||
-      Number(r.poc_rewards ?? 0) + Number(r.dc_rewards ?? 0)
-    const cur = netMeanByDay.get(day)
-    if (cur) {
-      cur.sum += tot
-      cur.n += 1
-    } else {
-      netMeanByDay.set(day, {sum: tot, n: 1})
+  // Arrow + per-hex cache + per-day net means
+  if (!tableCache || !hexDataCache || !netMeanByDay) {
+    console.log('Loading Arrow data…')
+    const absolute = path.resolve(DEFAULT_ARROW_PATH)
+    if (!fs.existsSync(absolute)) {
+      throw new Error(`Arrow file not found: ${absolute}`)
     }
+    const buf = fs.readFileSync(absolute)
+    tableCache = tableFromIPC(buf)
+
+    const allRows = tableCache.toArray().map((r) => {
+      const d: any = {...r}
+      // normalize data field & neighbor fallback (compat)
+      if (d.dc_transfer != null && d.dc_rewards == null)
+        d.dc_rewards = d.dc_transfer
+      if (d.neighbor_ma3_total == null && d.neighbor_ma7_total != null)
+        d.neighbor_ma3_total = d.neighbor_ma7_total
+
+      const t = new Date(d.date).getTime()
+      const day = day0(t)
+      const total =
+        Number(d.total_rewards ?? 0) ||
+        Number(d.poc_rewards ?? 0) + Number(d.dc_rewards ?? 0)
+
+      // global stats accumulators
+      globalMeanTotal += total
+      globalStdAccum += total * total
+      globalCount += 1
+
+      return {...d, date: day}
+    })
+
+    // per-hex history
+    hexDataCache = _.groupBy(allRows, 'hex')
+    for (const hex in hexDataCache) {
+      hexDataCache[hex] = _.sortBy(hexDataCache[hex], 'date')
+    }
+
+    // network mean per day
+    netMeanByDay = new Map()
+    for (const r of allRows) {
+      const day = r.date
+      const tot =
+        Number(r.total_rewards ?? 0) ||
+        Number(r.poc_rewards ?? 0) + Number(r.dc_rewards ?? 0)
+      const cur = netMeanByDay.get(day)
+      if (cur) {
+        cur.sum += tot
+        cur.n += 1
+      } else {
+        netMeanByDay.set(day, {sum: tot, n: 1})
+      }
+    }
+    console.log('Loaded hexes:', Object.keys(hexDataCache).length)
   }
 }
 
-// ---------- EAGER COLD-START MODEL LOAD ----------
-const eagerModelLoadPromise = (async () => {
-  try {
-    await loadModelsOnly()
-  } catch (e) {
-    console.error('Cold-start model load failed (will retry on request):', e)
-  }
-})()
-
-// ---------- FEATURE BUILDER (unchanged) ----------
+// ---------- FEATURE BUILDER FOR SINGLE MODEL ----------
 function buildFeatureDict(
   hexId: string,
   history: Row[],
@@ -239,12 +242,14 @@ function buildFeatureDict(
 ) {
   const last = history[history.length - 1] || {}
 
+  // Halving regime
   const isPost = currentDate.getTime() >= HALVING_DATE_UTC
   const daysSinceHalving = Math.max(
     0,
     Math.floor((day0(currentDate) - HALVING_DATE_UTC) / 86400000),
   )
 
+  // short lags & MAs (computed from history only -> leak-safe)
   const totals = history.map((r) => Number(r.total_rewards ?? 0))
   const lag1 = totals[totals.length - 1] ?? 0
   const lag2 = totals[totals.length - 2] ?? lag1
@@ -254,8 +259,9 @@ function buildFeatureDict(
   const vol7 = stddev(totals.slice(-7))
   const rsi7 = (() => {
     const diffs = []
-    for (let i = Math.max(0, totals.length - 8); i < totals.length - 1; i++)
+    for (let i = Math.max(0, totals.length - 8); i < totals.length - 1; i++) {
       diffs.push(totals[i + 1] - totals[i])
+    }
     const gains = diffs.filter((d) => d > 0)
     const losses = diffs.filter((d) => d < 0).map((d) => -d)
     const avgGain = mean(gains) || 0
@@ -266,6 +272,7 @@ function buildFeatureDict(
   const reward_cv = ma7 > 0 ? vol7 / ma7 : 0
   const lag1_div_ma3 = ma3 > 0 ? lag1 / ma3 : 0
 
+  // seasonal / naïve anchor (current-day DOW)
   const {
     day_of_week,
     week,
@@ -282,16 +289,19 @@ function buildFeatureDict(
   const naive_blend =
     0.8 * (0.5 * lag1 + 0.3 * lag2 + 0.2 * lag3) + 0.2 * seasonal_mean
 
+  // policy-adjusted statics
   const density =
     Number(last.density_k1 ?? 0) * Number(policy?.densityMult ?? 1)
   const txscale =
     Number(last.transmit_scale_approx ?? 0) * Number(policy?.txScaleMult ?? 1)
 
+  // neighbor + network context
   const neighbor_ma3_total = Number(last.neighbor_ma3_total ?? 0)
   const yday = day0(new Date(currentDate.getTime() - 86400000))
   const net_mean_lag1 = netMean(yday)
   const net_ma3_lag = netMA3Lag(yday)
 
+  // per-hex fixed effects ~ train-only mean/std (estimate from recent)
   const recent = totals.slice(-28)
   const hex_mean_train_total =
     recent.length >= 5
@@ -308,12 +318,15 @@ function buildFeatureDict(
         )
       : 0
 
+  // composition proxy from lag1 (if present)
   const poc_share_lag1 =
     lag1 > 0
       ? Number(last.poc_rewards ?? 0) / Number(last.total_rewards ?? lag1)
       : 0
 
+  // Compose features dictionary
   const f: Record<string, number | string> = {
+    // core anchors & short history
     naive_blend,
     lag1_total: lag1,
     lag2_total: lag2,
@@ -321,13 +334,14 @@ function buildFeatureDict(
     ma_3d_total: ma3,
     lag1_div_ma3,
 
+    // composition/volatility/trend proxies
     poc_share_lag1,
     trend_7d: (() => {
       const xs = totals.slice(-7)
       if (xs.length <= 1) return 0
       const x = xs.map((_, i) => i)
-      const xm = mean(x),
-        ym = mean(xs)
+      const xm = mean(x)
+      const ym = mean(xs)
       const denom = x.reduce((s, v) => s + (v - xm) ** 2, 0)
       if (denom === 0) return 0
       const num = xs.reduce((s, v, i) => s + (i - xm) * (v - ym), 0)
@@ -337,10 +351,12 @@ function buildFeatureDict(
     rsi_7d: rsi7,
     reward_cv,
 
+    // neighbor & network
     neighbor_ma3_total,
     net_mean_lag1,
     net_ma3_lag,
 
+    // calendar & regime
     day_of_week,
     sin_dow,
     cos_dow,
@@ -354,24 +370,33 @@ function buildFeatureDict(
     is_post_halving: isPost ? 1 : 0,
     days_since_halving: daysSinceHalving,
 
+    // deployment & density
     hotspot_count: Number(last.hotspot_count ?? 0),
     density_k1: density,
     transmit_scale_approx: txscale,
 
+    // fixed effects & seasonal level
     hex_mean_train_total,
     hex_std_train_total,
     seasonal_mean,
+
+    // identifiers the model may ignore (safe to include)
     hex: hexId,
   }
+
   return f
 }
+
 function tensorFromOrder(
   order: string[],
   dict: Record<string, number | string>,
 ) {
+  // Any missing features become 0; extra keys ignored.
   const arr = Float32Array.from(order.map((k) => Number(dict[k] ?? 0)))
   return new ort.Tensor('float32', arr, [1, order.length])
 }
+
+// naive blend for *next* day (for multiplicative anchoring)
 function naiveBlendNextDay(history: Row[], currentDate: Date) {
   const totals = history.map((r) => Number(r.total_rewards ?? 0))
   const lag1 = totals[totals.length - 1] ?? 0
@@ -384,9 +409,6 @@ function naiveBlendNextDay(history: Row[], currentDate: Date) {
 
 export async function GET(req: NextRequest) {
   try {
-    // Ensure cold-start model load has completed (even for observed calls)
-    await eagerModelLoadPromise
-
     const url = new URL(req.url)
 
     // Governance knobs
@@ -404,19 +426,6 @@ export async function GET(req: NextRequest) {
     const limit = Number(url.searchParams.get('limit') ?? '5000')
     const horizon = Math.max(1, Number(url.searchParams.get('horizon') ?? '1'))
 
-    // Observed-mode sampling controls
-    const full =
-      url.searchParams.get('full') === '1' ||
-      url.searchParams.get('full') === 'true'
-    const samplePct = Math.max(
-      0,
-      Math.min(
-        1,
-        Number(url.searchParams.get('sample') ?? `${DEFAULT_OBS_SAMPLE_PCT}`),
-      ),
-    )
-    const sampleSeed = Number(url.searchParams.get('seed') ?? '1') | 0
-
     // polygon lasso
     const polyRaw = url.searchParams.get('poly')
     let lassoPoly: [number, number][] | null = null
@@ -428,21 +437,19 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // Load data; models will have been loaded via cold-start promise,
-    // but still ensure them for forecast paths just in case.
-    if (forecast) {
-      await Promise.all([loadDataOnly(), loadModelsOnly()])
-    } else {
-      await loadDataOnly()
+    await loadDataAndModels()
+    if (!session || !featTotal || !hexDataCache) {
+      throw new Error('Initialization failed')
     }
-    if (!hexDataCache) throw new Error('Initialization failed')
 
     if (url.searchParams.get('debug') === '1') {
       return NextResponse.json({
         ok: true,
-        modelLoaded: Boolean(session),
+        model: 'advanced-lite: single total (residual-over-naive)',
+        blendWeights: blendWeights,
         hasConformalWidths: Boolean(conformalWidths),
-        hasBandFallback: Boolean(bandFallback),
+        bandFallback: bandFallback,
+        scalarToday: Date.now() >= HALVING_DATE_UTC ? 0.5 : 1.0,
       })
     }
 
@@ -452,6 +459,7 @@ export async function GET(req: NextRequest) {
       const selected: string[] = []
       for (const hexId of Object.keys(hexDataCache)) {
         const [clat, clon] = cellToLatLng(hexId)
+        // pointInPolygon (ray-cast)
         let inside = false
         for (
           let i = 0, j = lassoPoly.length - 1;
@@ -489,7 +497,7 @@ export async function GET(req: NextRequest) {
           : []
 
       if (hexes.length === 0) {
-        const body = {
+        return NextResponse.json({
           ok: true,
           filters: {
             hex: hexParam,
@@ -499,25 +507,23 @@ export async function GET(req: NextRequest) {
             limit,
             horizon,
             poly: !!lassoPoly,
-            densityMult,
-            txScaleMult,
-            pocShare: pocShareOverride ?? null,
-            sampling: {enabled: false, samplePct, seed: sampleSeed, full},
           },
           rows: [],
           totals: {rows: 0, poc_rewards: 0, dc_rewards: 0, total_rewards: 0},
-        }
-        return NextResponse.json(body)
+        })
       }
 
       // Target date defaults to today at 00:00 UTC (or "to" date)
       let targetDate = to ? new Date(to) : new Date()
       targetDate.setUTCHours(0, 0, 0, 0)
 
+      // Horizon weights / bands
       const wSched = blendWeights ?? {1: 0.9, 2: 0.8, 3: 0.7, 4: 0.6}
+
       const baseWidthFor = (h: number, scalar: number) => {
-        if (conformalWidths && conformalWidths[h] != null)
+        if (conformalWidths && conformalWidths[h] != null) {
           return conformalWidths[h] * scalar
+        }
         const width = bandFallback
           ? 0.5 * Math.abs(bandFallback.p90 - bandFallback.p10)
           : 0
@@ -525,45 +531,56 @@ export async function GET(req: NextRequest) {
       }
 
       for (const hexId of hexes) {
-        const fullHist = (hexDataCache[hexId] || []).slice()
-        if (fullHist.length === 0) continue
+        const full = (hexDataCache[hexId] || []).slice()
+        if (full.length === 0) continue
 
+        // ---- Anchor history to the day BEFORE target (no future leakage) ----
         const cutoff = new Date(targetDate)
         cutoff.setUTCDate(cutoff.getUTCDate() - 1)
         const cutoffMs = day0(cutoff)
-        let history = fullHist.filter((r) => r.date <= cutoffMs)
-        if (history.length === 0)
-          history = fullHist.slice(0, Math.min(14, fullHist.length))
+
+        let history = full.filter((r) => r.date <= cutoffMs)
+        if (history.length === 0) {
+          // seed with earliest window if nothing before target
+          history = full.slice(0, Math.min(14, full.length))
+        }
+        // ---------------------------------------------------------------------
 
         const forecasts: ModeledRow[] = []
         let currentDate = new Date(targetDate)
 
         for (let step = 0; step < horizon; step++) {
           const lastKnownDay = history[history.length - 1]
+
+          // Build features for this day (current DOW), include policy multipliers
           const featureDict = buildFeatureDict(hexId, history, currentDate, {
             densityMult,
             txScaleMult,
           })
-          const totalIn = tensorFromOrder(featTotal!, featureDict)
-          const out = await session!.run({input: totalIn})
-          const corr = (Object.values(out)[0].data as Float32Array)[0]
+          const totalIn = tensorFromOrder(featTotal, featureDict)
+          const out = await session.run({input: totalIn})
+          const corr = (Object.values(out)[0].data as Float32Array)[0] // log correction
 
+          // Anchored to NEXT-day naive blend
           const naiveNext = naiveBlendNextDay(history, currentDate)
           let modelMedian = Math.max(
             0,
             (naiveNext + EPSILON) * Math.exp(corr) - EPSILON,
           )
 
+          // Blend vs naiveNext for stability by horizon
           const h = step + 1
           const w = wSched[h] ?? 0.6
           const blended = w * modelMedian + (1 - w) * naiveNext
 
+          // Bands: scale by halving regime + mild horizon growth
           const scalar = currentDate.getTime() >= HALVING_DATE_UTC ? 0.5 : 1.0
           const baseWidth = baseWidthFor(h, scalar)
           const width = baseWidth * (1 + 0.05 * Math.sqrt(h))
           const lower = Math.max(blended - width, 0)
           const upper = blended + width
 
+          // Split total into PoC/Data
           const sBase =
             pocShareParam != null ? pocShareParam : pocShareEMA(history)
           const poc = blended * sBase
@@ -586,6 +603,7 @@ export async function GET(req: NextRequest) {
           forecasts.push(predictedRow)
           history.push(predictedRow)
 
+          // advance day
           currentDate = new Date(currentDate)
           currentDate.setUTCDate(currentDate.getUTCDate() + 1)
         }
@@ -614,18 +632,6 @@ export async function GET(req: NextRequest) {
         allHistoricalRows = allHistoricalRows.filter((r) => only.has(r.hex))
       }
 
-      // Deterministic sampling (observed only, no region/hex, not full)
-      if (!full && !lassoPoly && !hexParam) {
-        const allowedHexes = new Set(
-          Object.keys(hexDataCache!).filter(
-            (h) => hashUnit(h, sampleSeed) < samplePct,
-          ),
-        )
-        allHistoricalRows = allHistoricalRows.filter((r) =>
-          allowedHexes.has(r.hex),
-        )
-      }
-
       outputRows = allHistoricalRows
         .filter((r) => r.date >= fromTime && r.date <= toTime)
         .slice(0, limit)
@@ -636,7 +642,7 @@ export async function GET(req: NextRequest) {
       poc_rewards: Number(r.poc_rewards ?? 0),
       dc_rewards: Number(r.dc_rewards ?? 0),
       total_rewards: Number(r.total_rewards ?? 0),
-      date: new Date(r.date).toISOString().split('T')[0],
+      date: new Date(r.date).toISOString().split('T')[0], // yyyy-mm-dd
     }))
 
     // quick totals
@@ -655,7 +661,7 @@ export async function GET(req: NextRequest) {
       return acc
     })()
 
-    const body = {
+    return NextResponse.json({
       ok: true,
       filters: {
         hex: hexParam,
@@ -668,26 +674,10 @@ export async function GET(req: NextRequest) {
         densityMult,
         txScaleMult,
         pocShare: pocShareOverride ?? null,
-        sampling: {
-          enabled: !forecast && !full,
-          samplePct,
-          seed: sampleSeed,
-          full,
-        },
       },
       rows: finalRows,
       totals,
-    }
-
-    const canCacheObserved = !forecast && !hexParam && !lassoPoly && !full
-    if (canCacheObserved) {
-      return NextResponse.json(body, {
-        headers: {
-          'Cache-Control': 'public, s-maxage=300, stale-while-revalidate=86400',
-        },
-      })
-    }
-    return NextResponse.json(body)
+    })
   } catch (e: any) {
     console.error('API Error:', e)
     return NextResponse.json(
