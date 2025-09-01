@@ -1,3 +1,11 @@
 [functions]
   # include the dataset in the lambda bundle
   included_files = ["data/features/iot/ca_iot_daily.arrow"]
+
+[functions."api/iot/h3/daily"]
+  memory = 1024
+  timeout = 25
+
+[[scheduled.functions]]
+  name = "warm-forecaster"
+  cron = "*/4 * * * *"
