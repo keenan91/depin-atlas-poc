@@ -1,3 +1,10 @@
-[functions]
-  # include the dataset in the lambda bundle
-  included_files = ["data/features/iot/ca_iot_daily.arrow"]
+[function[functions]
+  node_bundler = "esbuild"
+  # onnxruntime-node is a native addon; don't inline it—ship it as-is
+  external_node_modules = ["onnxruntime-node"]
+  # make sure the lambda zip actually contains the runtime, models, and data
+  included_files = [
+    "node_modules/onnxruntime-node/**",
+    "public/models/**",
+    "data/features/iot/**"
+  ]
