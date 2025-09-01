@@ -221,6 +221,15 @@ async function loadDataOnly() {
   }
 }
 
+// ---------- EAGER COLD-START MODEL LOAD ----------
+const eagerModelLoadPromise = (async () => {
+  try {
+    await loadModelsOnly()
+  } catch (e) {
+    console.error('Cold-start model load failed (will retry on request):', e)
+  }
+})()
+
 // ---------- FEATURE BUILDER (unchanged) ----------
 function buildFeatureDict(
   hexId: string,
@@ -375,6 +384,9 @@ function naiveBlendNextDay(history: Row[], currentDate: Date) {
 
 export async function GET(req: NextRequest) {
   try {
+    // Ensure cold-start model load has completed (even for observed calls)
+    await eagerModelLoadPromise
+
     const url = new URL(req.url)
 
     // Governance knobs
@@ -416,9 +428,13 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    await loadDataOnly()
-    if (forecast) await loadModelsOnly()
-
+    // Load data; models will have been loaded via cold-start promise,
+    // but still ensure them for forecast paths just in case.
+    if (forecast) {
+      await Promise.all([loadDataOnly(), loadModelsOnly()])
+    } else {
+      await loadDataOnly()
+    }
     if (!hexDataCache) throw new Error('Initialization failed')
 
     if (url.searchParams.get('debug') === '1') {
