@@ -19,6 +19,18 @@ const HALVING_DATE_UTC = Date.UTC(2025, 7, 1)
 
 const EPSILON = 1e-6
 
+const DEFAULT_OBS_SAMPLE_PCT = Number(process.env.IOT_OBS_SAMPLE_PCT ?? '0.12')
+
+function hashUnit(str: string, seed = 1) {
+  // FNV-1a-ish 32-bit with multiply mix; fast & stable
+  let h = (0x811c9dc5 ^ seed) >>> 0
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0) / 4294967296
+}
+
 // ---------- CACHES ----------
 let session: ort.InferenceSession | null = null
 let featTotal: string[] | null = null
@@ -426,6 +438,19 @@ export async function GET(req: NextRequest) {
     const limit = Number(url.searchParams.get('limit') ?? '5000')
     const horizon = Math.max(1, Number(url.searchParams.get('horizon') ?? '1'))
 
+    // Observed-mode sampling controls
+    const full =
+      url.searchParams.get('full') === '1' ||
+      url.searchParams.get('full') === 'true'
+    const samplePct = Math.max(
+      0,
+      Math.min(
+        1,
+        Number(url.searchParams.get('sample') ?? `${DEFAULT_OBS_SAMPLE_PCT}`),
+      ),
+    )
+    const sampleSeed = Number(url.searchParams.get('seed') ?? '1') | 0
+
     // polygon lasso
     const polyRaw = url.searchParams.get('poly')
     let lassoPoly: [number, number][] | null = null
@@ -507,6 +532,15 @@ export async function GET(req: NextRequest) {
             limit,
             horizon,
             poly: !!lassoPoly,
+            densityMult,
+            txScaleMult,
+            pocShare: pocShareOverride ?? null,
+            sampling: {
+              enabled: false,
+              samplePct,
+              seed: sampleSeed,
+              full,
+            },
           },
           rows: [],
           totals: {rows: 0, poc_rewards: 0, dc_rewards: 0, total_rewards: 0},
@@ -531,18 +565,18 @@ export async function GET(req: NextRequest) {
       }
 
       for (const hexId of hexes) {
-        const full = (hexDataCache[hexId] || []).slice()
-        if (full.length === 0) continue
+        const fullHist = (hexDataCache[hexId] || []).slice()
+        if (fullHist.length === 0) continue
 
         // ---- Anchor history to the day BEFORE target (no future leakage) ----
         const cutoff = new Date(targetDate)
         cutoff.setUTCDate(cutoff.getUTCDate() - 1)
         const cutoffMs = day0(cutoff)
 
-        let history = full.filter((r) => r.date <= cutoffMs)
+        let history = fullHist.filter((r) => r.date <= cutoffMs)
         if (history.length === 0) {
           // seed with earliest window if nothing before target
-          history = full.slice(0, Math.min(14, full.length))
+          history = fullHist.slice(0, Math.min(14, fullHist.length))
         }
         // ---------------------------------------------------------------------
 
@@ -624,13 +658,27 @@ export async function GET(req: NextRequest) {
       }
       if (hexParam) {
         const only = new Set(
-          hexParam
+          (hexParam as string)
             .split(',')
             .map((s) => s.trim())
             .filter(Boolean),
         )
         allHistoricalRows = allHistoricalRows.filter((r) => only.has(r.hex))
       }
+
+      // ---- Deterministic sampling for observed mode (default) ----
+      // Skip sampling if user explicitly asked for full, or if region/hex filters already narrow the set.
+      if (!forecast && !full && !lassoPoly && !hexParam) {
+        const allowedHexes = new Set(
+          Object.keys(hexDataCache!).filter(
+            (h) => hashUnit(h, sampleSeed) < samplePct,
+          ),
+        )
+        allHistoricalRows = allHistoricalRows.filter((r) =>
+          allowedHexes.has(r.hex),
+        )
+      }
+      // ------------------------------------------------------------
 
       outputRows = allHistoricalRows
         .filter((r) => r.date >= fromTime && r.date <= toTime)
@@ -674,6 +722,12 @@ export async function GET(req: NextRequest) {
         densityMult,
         txScaleMult,
         pocShare: pocShareOverride ?? null,
+        sampling: {
+          enabled: !forecast && !full,
+          samplePct,
+          seed: sampleSeed,
+          full,
+        },
       },
       rows: finalRows,
       totals,
