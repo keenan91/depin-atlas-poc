@@ -1,8 +1,6 @@
-[function[functions]
+[functions]
   node_bundler = "esbuild"
-  # onnxruntime-node is a native addon; don't inline it—ship it as-is
   external_node_modules = ["onnxruntime-node"]
-  # make sure the lambda zip actually contains the runtime, models, and data
   included_files = [
     "node_modules/onnxruntime-node/**",
     "public/models/**",
