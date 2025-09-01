@@ -416,11 +416,9 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    if (forecast) {
-      await Promise.all([loadDataOnly(), loadModelsOnly()])
-    } else {
-      await loadDataOnly() // do NOT load ONNX for observed-only calls
-    }
+    await loadDataOnly()
+    if (forecast) await loadModelsOnly()
+
     if (!hexDataCache) throw new Error('Initialization failed')
 
     if (url.searchParams.get('debug') === '1') {
@@ -669,7 +667,6 @@ export async function GET(req: NextRequest) {
     if (canCacheObserved) {
       return NextResponse.json(body, {
         headers: {
-          // cache on CDN 5 minutes; serve stale while revalidating for a day
           'Cache-Control': 'public, s-maxage=300, stale-while-revalidate=86400',
         },
       })
