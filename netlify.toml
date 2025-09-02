@@ -1,11 +1,13 @@
 [functions]
-  # include the dataset in the lambda bundle
-  included_files = ["data/features/iot/ca_iot_daily.arrow"]
+  node_bundler = "esbuild"
+  external_node_modules = ["onnxruntime-node"]
+  included_files = [
+    "node_modules/onnxruntime-node/**",
+    "public/models/**",
+    "data/features/iot/**"
+  ]
 
-[functions."api/iot/h3/daily"]
-  memory = 1024
-  timeout = 25
-
-[[scheduled.functions]]
-  name = "warm-forecaster"
-  cron = "*/4 * * * *"
+# Scheduled function (production only; cron is UTC)
+[[scheduled_functions]]
+  path = "warm-forecaster"
+  schedule = "*/4 * * * *"
