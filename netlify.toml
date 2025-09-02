@@ -6,12 +6,8 @@
     "public/models/**",
     "data/features/iot/**"
   ]
-
 [functions."api/iot/h3/daily"]
   memory = 1024
   timeout = 25
-
-# Scheduled function (production only; cron is UTC)
-[[scheduled_functions]]
-  path = "warm-forecaster"
-  schedule = "*/4 * * * *"
+[functions."warm-forecaster"]
+  schedule = "*/4 * * * *"  
